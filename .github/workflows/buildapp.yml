@@ -158,8 +158,8 @@ jobs:
                 # build.sh already produces Sparkle[_<flags>]_v<version>_IG_v<ig version>.ipa
                 IPA_PATH="$(ls -t main/packages/Sparkle_*_IG_v*.ipa | head -n1)"
                 echo "package=$(basename "$IPA_PATH")" >> "$GITHUB_OUTPUT"
-                echo "path=${IPA_PATH}" >> "$GITHUB_OUTPUT"
-
+                echo "path=${IPA_PATH#main/}" >> "$GITHUB_OUTPUT"
+                
             - name: Upload Artifact
               if: ${{ inputs.upload_artifact }}
               uses: actions/upload-artifact@v4
