@@ -1,3 +1,4 @@
+#import "SPKStrings.h"
 #import "SPKGalleryViewController.h"
 #import "../../AssetUtils.h"
 #import "../../InstagramHeaders.h"
@@ -119,6 +120,15 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 @property (nonatomic, strong) NSMutableSet<NSString *> *filterUsernames;
 @property (nonatomic, assign) BOOL selectionMode;
 @property (nonatomic, strong) NSMutableSet<NSString *> *selectedFileIDs;
+// Set while the two-finger multiple-selection drag is in flight. The drag drives
+// selection through the collection view's own selected state, so the tap path
+// has to stop clearing it, and the header chips have to stay put until the
+// fingers lift (removing them mid-drag shifts the rows under them).
+@property (nonatomic, weak, nullable) UIPinchGestureRecognizer *gridDensityPinch;
+@property (nonatomic, weak, nullable) UIGestureRecognizer *multiSelectOneFingerPan;
+@property (nonatomic, assign) BOOL multiSelectDragActive;
+@property (nonatomic, assign) BOOL multiSelectDragOpenedSelection;
+@property (nonatomic, strong, nullable) UISelectionFeedbackGenerator *multiSelectDragFeedback;
 // Signatures of the last-applied nav bar items, tracked separately for the
 // leading and trailing groups. The leading button changes as you browse folders
 // (close ⇄ back), but the trailing group does not — so reassigning trailing on
@@ -291,6 +301,16 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
     [self updateCollectionInsets];
 }
 
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+
+    // UIKit adds its selection recognizers with the interaction rather than at
+    // init, and recomputes their enabled state whenever it revisits the
+    // collection view's selection support, so the one-finger pan is caught here
+    // instead of only once at setup.
+    [self disableOneFingerMultiSelectPan];
+}
+
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
     // Hide the shared toolbar when navigating to a child that shouldn't show it
@@ -341,11 +361,11 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
     NSString *text = nil;
     if (self.selectionMode) {
         text = self.selectedFileIDs.count > 0
-                   ? [NSString stringWithFormat:@"%lu Selected", (unsigned long)self.selectedFileIDs.count]
-                   : @"Select Files";
+                   ? [NSString stringWithFormat:SPKL(@"AUTO_SAVE_AUTO_SAVE_FILTER_VALUE_SELECTED_FORMAT"), (unsigned long)self.selectedFileIDs.count]
+                   : SPKL(@"GALLERY_GALLERY_SELECT_FILES_TEXT");
     } else {
         text = self.currentFolderPath.length > 0 ? [self.currentFolderPath lastPathComponent]
-                                                 : (self.seededFilterTitle.length > 0 ? self.seededFilterTitle : @"Gallery");
+                                                 : (self.seededFilterTitle.length > 0 ? self.seededFilterTitle : SPKL(@"GALLERY_TITLE"));
     }
     self.navigationItem.titleView = nil;
     self.title = text;
@@ -370,10 +390,10 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
     [controller.searchBar setImage:[SPKAssetUtils instagramIconNamed:@"search" pointSize:18.0]
                   forSearchBarIcon:UISearchBarIconSearch
                              state:UIControlStateNormal];
-    controller.searchBar.placeholder = @"Search Gallery";
+    controller.searchBar.placeholder = SPKL(@"GALLERY_GALLERY_PICKER_SEARCH_GALLERY_TEXT");
     // Scope toggle: search the current folder, or across all folders. Let the
     // search controller manage the scope bar's visibility (shown while searching).
-    controller.searchBar.scopeButtonTitles = @[ @"This Folder", @"All Folders" ];
+    controller.searchBar.scopeButtonTitles = @[ SPKL(@"GALLERY_GALLERY_PICKER_FOLDER_TEXT"), SPKL(@"GALLERY_GALLERY_PICKER_FOLDERS_TEXT") ];
     controller.automaticallyShowsScopeBar = YES;
     self.searchController = controller;
     self.navigationItem.searchController = controller;
@@ -405,16 +425,16 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 - (void)refreshNavigationItems {
     // Selection-mode select-all icon reflects current selection.
     NSString *selectionIcon = @"circle";
-    NSString *selectionAccessibilityLabel = @"Select all";
+    NSString *selectionAccessibilityLabel = SPKL(@"ACTION_BUTTON_BULK_MEDIA_SELECTION_SELECT_TEXT");
     if (self.selectionMode) {
         NSArray<SPKGalleryFile *> *files = [self visibleGalleryFiles];
         BOOL allSelected = files.count > 0 && self.selectedFileIDs.count == files.count;
         if (allSelected) {
             selectionIcon = @"circle_check_filled";
-            selectionAccessibilityLabel = @"Deselect all";
+            selectionAccessibilityLabel = SPKL(@"ACTION_BUTTON_BULK_MEDIA_SELECTION_DESELECT_TEXT");
         } else if (self.selectedFileIDs.count > 0) {
             selectionIcon = @"circle_check";
-            selectionAccessibilityLabel = @"Select all";
+            selectionAccessibilityLabel = SPKL(@"ACTION_BUTTON_BULK_MEDIA_SELECTION_SELECT_TEXT");
         }
     }
 
@@ -431,12 +451,12 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
         UIBarButtonItem *leadingItem;
         if (self.selectionMode) {
             leadingItem = SPKMediaChromeTopBarButtonItem(@"xmark", self, @selector(exitSelectionMode));
-            leadingItem.accessibilityLabel = @"Cancel";
+            leadingItem.accessibilityLabel = SPKL(@"ALERT_ACTION_CANCEL");
         } else if ([self canNavigateBackInFolders]) {
             leadingItem = SPKMediaChromeTopBarButtonItem(@"chevron_left", self, @selector(navigateBackInFolders));
         } else if (isPushed) {
             leadingItem = SPKMediaChromeTopBarButtonItem(@"chevron_left", self, @selector(popSelf));
-            leadingItem.accessibilityLabel = @"Back";
+            leadingItem.accessibilityLabel = SPKL(@"GALLERY_GALLERY_PICKER_BACK_TEXT");
         } else {
             leadingItem = SPKMediaChromeTopBarButtonItem(@"xmark", self, @selector(dismissSelf));
         }
@@ -479,22 +499,22 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 
     NSArray<UIBarButtonItem *> *primary;
     if (self.selectionMode) {
-        UIBarButtonItem *shareItem = [self galleryBottomBarItemWithResource:@"share" accessibility:@"Share selected" action:@selector(shareSelectedFiles)];
-        UIBarButtonItem *moveItem = [self galleryBottomBarItemWithResource:@"folder_move" accessibility:@"Move selected" action:@selector(moveSelectedFiles)];
-        UIBarButtonItem *favoriteItem = [self galleryBottomBarItemWithResource:@"heart" accessibility:@"Favorite selected" action:@selector(toggleFavoriteForSelectedFiles)];
-        UIBarButtonItem *deleteItem = [self galleryBottomBarItemWithResource:@"trash" accessibility:@"Delete selected" action:@selector(deleteSelectedFiles)];
+        UIBarButtonItem *shareItem = [self galleryBottomBarItemWithResource:@"share" accessibility:SPKL(@"GALLERY_GALLERY_SHARE_SELECTED_TEXT") action:@selector(shareSelectedFiles)];
+        UIBarButtonItem *moveItem = [self galleryBottomBarItemWithResource:@"folder_move" accessibility:SPKL(@"GALLERY_GALLERY_MOVE_SELECTED_TEXT") action:@selector(moveSelectedFiles)];
+        UIBarButtonItem *favoriteItem = [self galleryBottomBarItemWithResource:@"heart" accessibility:SPKL(@"GALLERY_GALLERY_FAVORITE_SELECTED_TEXT") action:@selector(toggleFavoriteForSelectedFiles)];
+        UIBarButtonItem *deleteItem = [self galleryBottomBarItemWithResource:@"trash" accessibility:SPKL(@"GALLERY_GALLERY_DELETE_SELECTED_TEXT") action:@selector(deleteSelectedFiles)];
         deleteItem.tintColor = [SPKUtils SPKColor_InstagramDestructive];
 
         primary = @[ shareItem, moveItem, favoriteItem, deleteItem ];
     } else {
-        UIBarButtonItem *filterItem = [self galleryBottomBarItemWithResource:@"filter" accessibility:@"Filter" action:@selector(presentFilter)];
-        UIBarButtonItem *sortItem = [self galleryBottomBarItemWithResource:@"sort" accessibility:@"Sort" action:@selector(presentSort)];
+        UIBarButtonItem *filterItem = [self galleryBottomBarItemWithResource:@"filter" accessibility:SPKL(@"GALLERY_GALLERY_FILTER_FILTER_TEXT") action:@selector(presentFilter)];
+        UIBarButtonItem *sortItem = [self galleryBottomBarItemWithResource:@"sort" accessibility:SPKL(@"MENU_SORT") action:@selector(presentSort)];
 
         NSString *toggleResource = self.viewMode == SPKGalleryViewModeGrid ? @"list" : @"grid";
-        NSString *toggleAX = self.viewMode == SPKGalleryViewModeGrid ? @"List view" : @"Grid view";
+        NSString *toggleAX = self.viewMode == SPKGalleryViewModeGrid ? SPKL(@"GALLERY_GALLERY_PICKER_LIST_VIEW_TEXT") : SPKL(@"GALLERY_GALLERY_PICKER_GRID_VIEW_TEXT");
         UIBarButtonItem *toggleItem = [self galleryBottomBarItemWithResource:toggleResource accessibility:toggleAX action:@selector(toggleViewMode)];
 
-        UIBarButtonItem *folderItem = [self galleryBottomBarItemWithResource:@"folder" accessibility:@"New folder" action:@selector(presentCreateFolder)];
+        UIBarButtonItem *folderItem = [self galleryBottomBarItemWithResource:@"folder" accessibility:SPKL(@"GALLERY_GALLERY_NEW_FOLDER_TEXT") action:@selector(presentCreateFolder)];
 
         primary = self.locksSeededFilter ? @[ toggleItem, sortItem, folderItem ]
                                          : @[ toggleItem, sortItem, filterItem, folderItem ];
@@ -528,7 +548,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
         }
     }
     if (!searchItem) {
-        searchItem = [self galleryBottomBarItemWithResource:@"search" accessibility:@"Search" action:@selector(activateSearch)];
+        searchItem = [self galleryBottomBarItemWithResource:@"search" accessibility:SPKL(@"PROFILE_PROFILE_ANALYZER_LIST_SEARCH_TEXT") action:@selector(activateSearch)];
     }
     return searchItem;
 }
@@ -555,6 +575,8 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 
     UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(handleGridPinch:)];
     [_collectionView addGestureRecognizer:pinch];
+    self.gridDensityPinch = pinch;
+    [self updateTwoFingerGestureConfiguration];
 
     [NSLayoutConstraint activateConstraints:@[
         [_collectionView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
@@ -609,6 +631,51 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
     [self.collectionView reloadData];
     [self updateEmptyState];
     [self refreshBottomToolbarItems];
+    [self updateTwoFingerGestureConfiguration];
+}
+
+/// List and grid both want the two-finger touches, so hand them to exactly one
+/// owner per mode: the multiple-selection drag in list, the density pinch in grid.
+///
+/// UIKit keeps its own two-finger selection pan disabled unless the collection
+/// view reports that it supports multiple selection, which it answers from
+/// allowsMultipleSelectionDuringEditing (and from allowsMultipleSelection when it
+/// decides whether the sweep may run). Both are off by default, so implementing
+/// the delegate methods alone leaves the gesture permanently disabled. Turning
+/// them on costs nothing here: taps deselect immediately and the drag hands its
+/// result back to selectedFileIDs, so the collection view's own selected state is
+/// only ever borrowed for the length of a sweep.
+- (void)updateTwoFingerGestureConfiguration {
+    BOOL listMode = (self.viewMode == SPKGalleryViewModeList);
+    self.gridDensityPinch.enabled = !listMode;
+    self.collectionView.allowsMultipleSelection = listMode;
+    self.collectionView.allowsMultipleSelectionDuringEditing = listMode;
+    [self disableOneFingerMultiSelectPan];
+}
+
+/// Supporting multiple selection brings in a second selection recognizer beside
+/// the two-finger drag: a one-finger pan that starts a sweep from a swipe across
+/// the list's short axis. That turns an ordinary horizontal swipe into a
+/// selection, including one that begins at the scroll indicator, so only the
+/// two-finger drag is left switched on. If a future iOS drops the recognizer
+/// this finds nothing and the gesture set is whatever that release ships.
+- (void)disableOneFingerMultiSelectPan {
+    if (self.multiSelectOneFingerPan) {
+        self.multiSelectOneFingerPan.enabled = NO;
+        return;
+    }
+
+    Class oneFingerPanClass = NSClassFromString(@"_UIMultiSelectOneFingerPanGesture");
+    if (!oneFingerPanClass) {
+        return;
+    }
+    for (UIGestureRecognizer *recognizer in self.collectionView.gestureRecognizers) {
+        if ([recognizer isKindOfClass:oneFingerPanClass]) {
+            recognizer.enabled = NO;
+            self.multiSelectOneFingerPan = recognizer;
+            break;
+        }
+    }
 }
 
 #pragma mark - Grid Density
@@ -710,7 +777,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 
     UILabel *label = [[UILabel alloc] initWithFrame:CGRectZero];
     label.translatesAutoresizingMaskIntoConstraints = NO;
-    label.text = @"No files in Gallery";
+    label.text = SPKL(@"GALLERY_GALLERY_NO_FILES_GALLERY_TEXT");
     label.textColor = [SPKUtils SPKColor_InstagramPrimaryText];
     label.font = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
     label.textAlignment = NSTextAlignmentCenter;
@@ -719,7 +786,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 
     UILabel *subtitle = [[UILabel alloc] initWithFrame:CGRectZero];
     subtitle.translatesAutoresizingMaskIntoConstraints = NO;
-    subtitle.text = @"Media you save with Sparkle will appear here.";
+    subtitle.text = SPKL(@"GALLERY_GALLERY_MEDIA_SAVE_SPARKLE_APPEAR_HERE_TEXT");
     subtitle.textColor = [SPKUtils SPKColor_InstagramSecondaryText];
     subtitle.font = [UIFont systemFontOfSize:14];
     subtitle.textAlignment = NSTextAlignmentCenter;
@@ -772,17 +839,17 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
     NSString *title;
     NSString *subtitle;
     if (query.length > 0) {
-        title = @"No results";
-        subtitle = @"No media matches your search.";
+        title = SPKL(@"GALLERY_GALLERY_PICKER_NO_RESULTS_TEXT");
+        subtitle = SPKL(@"GALLERY_GALLERY_PICKER_NO_MEDIA_MATCHES_SEARCH_TEXT");
     } else if (hasFilters) {
-        title = @"No matching files";
-        subtitle = @"Try adjusting your filters.";
+        title = SPKL(@"GALLERY_GALLERY_PICKER_NO_MATCHING_FILES_TEXT");
+        subtitle = SPKL(@"GALLERY_GALLERY_PICKER_TRY_ADJUSTING_FILTERS_TEXT");
     } else if (folderName.length > 0) {
-        title = @"This folder is empty";
-        subtitle = [NSString stringWithFormat:@"Media you save to “%@” will appear here.", folderName];
+        title = SPKL(@"GALLERY_GALLERY_PICKER_FOLDER_EMPTY_TEXT");
+        subtitle = [NSString stringWithFormat:SPKL(@"GALLERY_FOLDER_EMPTY_SUBTITLE_FORMAT"), folderName];
     } else {
-        title = @"No files in Gallery";
-        subtitle = @"Media you save with Sparkle will appear here.";
+        title = SPKL(@"GALLERY_GALLERY_NO_FILES_GALLERY_TEXT");
+        subtitle = SPKL(@"GALLERY_GALLERY_MEDIA_SAVE_SPARKLE_APPEAR_HERE_TEXT");
     }
     self.emptyStateLabel.text = title;
     self.emptyStateSubtitle.text = subtitle;
@@ -1281,6 +1348,14 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 #pragma mark - UICollectionViewDelegate
 
 - (void)collectionView:(UICollectionView *)cv didSelectItemAtIndexPath:(NSIndexPath *)indexPath {
+    // During the two-finger drag the collection view owns the selected state and
+    // decides the direction of the sweep, so mirror it instead of toggling, and
+    // leave the item selected so a reversed drag reports a matching deselect.
+    if (self.multiSelectDragActive) {
+        [self applyDragSelection:YES atIndexPath:indexPath];
+        return;
+    }
+
     [cv deselectItemAtIndexPath:indexPath animated:YES];
 
     if ([self isFolderIndexPath:indexPath]) {
@@ -1309,8 +1384,121 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
                             fromViewController:self];
 }
 
+- (void)collectionView:(UICollectionView *)cv didDeselectItemAtIndexPath:(NSIndexPath *)indexPath {
+    // Only the drag deselects meaningfully. Programmatic deselection does not
+    // reach the delegate, so the tap path never lands here.
+    if (!self.multiSelectDragActive) {
+        return;
+    }
+    [self applyDragSelection:NO atIndexPath:indexPath];
+}
+
+#pragma mark - Two-finger multiple selection
+
+- (BOOL)collectionView:(UICollectionView *)cv
+    shouldBeginMultipleSelectionInteractionAtIndexPath:(NSIndexPath *)indexPath {
+    // List rows only: the grid already answers a two-finger gesture with the
+    // column-density pinch, and the two would fight over the same touches.
+    if (self.viewMode != SPKGalleryViewModeList) {
+        return NO;
+    }
+    if ([self isFolderIndexPath:indexPath] || ![self galleryFileForCollectionIndexPath:indexPath]) {
+        return NO;
+    }
+
+    // The collection view reads its own selected state to decide whether this
+    // sweep selects or deselects, so publish our set into it before it begins.
+    // Starting on an already-picked row then unpicks along the drag.
+    [self syncCollectionSelectionFromSelectedFiles];
+    return YES;
+}
+
+- (void)collectionView:(UICollectionView *)cv
+    didBeginMultipleSelectionInteractionAtIndexPath:(NSIndexPath *)indexPath {
+    self.multiSelectDragActive = YES;
+    self.multiSelectDragFeedback = [[UISelectionFeedbackGenerator alloc] init];
+    [self.multiSelectDragFeedback prepare];
+
+    // Only a drag that opened selection mode itself is allowed to close it again
+    // when it ends up picking nothing. A drag inside an existing selection stays.
+    self.multiSelectDragOpenedSelection = !self.selectionMode;
+    if (!self.selectionMode) {
+        CGFloat chipHeight =
+            [self showsFolderChips] ? [SPKGalleryFolderChipBar preferredHeight] : 0.0;
+        [self enterSelectionMode];
+
+        // Selection mode retires the chip header, which pulls every row up by its
+        // height while the fingers are still down, so the sweep would carry on
+        // over rows that moved. Scrolling back by the same amount keeps the media
+        // under the fingers exactly where it was.
+        if (chipHeight > 0.0 && ![self showsFolderChips]) {
+            [cv layoutIfNeeded];
+            CGPoint offset = cv.contentOffset;
+            offset.y = MAX(-cv.adjustedContentInset.top, offset.y - chipHeight);
+            cv.contentOffset = offset;
+        }
+    }
+}
+
+- (void)collectionViewDidEndMultipleSelectionInteraction:(UICollectionView *)cv {
+    self.multiSelectDragActive = NO;
+    self.multiSelectDragFeedback = nil;
+
+    // Hand ownership of the selection back to selectedFileIDs, which drives the
+    // badges from here on.
+    for (NSIndexPath *indexPath in [cv.indexPathsForSelectedItems copy]) {
+        [cv deselectItemAtIndexPath:indexPath animated:NO];
+    }
+
+    if (self.multiSelectDragOpenedSelection && self.selectedFileIDs.count == 0) {
+        [self exitSelectionMode];
+    }
+    self.multiSelectDragOpenedSelection = NO;
+}
+
+/// Mirrors one drag-reported item into `selectedFileIDs` and its cell badge.
+- (void)applyDragSelection:(BOOL)selected atIndexPath:(NSIndexPath *)indexPath {
+    SPKGalleryFile *file = [self galleryFileForCollectionIndexPath:indexPath];
+    if (file.identifier.length == 0) {
+        return;
+    }
+    if ([self.selectedFileIDs containsObject:file.identifier] == selected) {
+        return;
+    }
+
+    if (selected) {
+        [self.selectedFileIDs addObject:file.identifier];
+    } else {
+        [self.selectedFileIDs removeObject:file.identifier];
+    }
+
+    [self.multiSelectDragFeedback selectionChanged];
+    [self.multiSelectDragFeedback prepare];
+    [self setupCenteredTitle];
+    [self refreshNavigationItems];
+    [self updateSelectionBadgeForFile:file selected:selected];
+}
+
+/// Publishes `selectedFileIDs` into the collection view's own selected state,
+/// which is otherwise kept empty because taps deselect immediately.
+- (void)syncCollectionSelectionFromSelectedFiles {
+    if (self.selectedFileIDs.count == 0) {
+        return;
+    }
+
+    NSArray<SPKGalleryFile *> *files = [self visibleGalleryFiles];
+    [files enumerateObjectsUsingBlock:^(SPKGalleryFile *file, NSUInteger idx, BOOL *stop) {
+        if (file.identifier.length == 0 || ![self.selectedFileIDs containsObject:file.identifier]) {
+            return;
+        }
+        [self.collectionView selectItemAtIndexPath:[NSIndexPath indexPathForItem:(NSInteger)idx inSection:0]
+                                          animated:NO
+                                    scrollPosition:UICollectionViewScrollPositionNone];
+    }];
+}
+
 - (void)showGalleryOpenFailureMessage:(NSString *)title actionIdentifier:(NSString *)actionIdentifier {
-    SPKNotify(actionIdentifier, title, @"The original content may no longer exist.", @"error_filled", SPKNotificationToneError);
+    SPKNotify(actionIdentifier, title, SPKL(@"COMMON_ORIGINAL_CONTENT_UNAVAILABLE_TOAST"), @"error_filled", SPKNotificationToneError);
 }
 
 - (void)dismissGalleryForOriginOpenWithCompletion:(void (^)(void))completion {
@@ -1327,10 +1515,22 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 }
 
 - (void)openOriginalPostForFile:(SPKGalleryFile *)file {
-    NSString *noun = [[file openOriginalActionTitle] hasPrefix:@"Open "]
-                         ? [[file openOriginalActionTitle] substringFromIndex:5]
-                         : @"original post";
-    NSString *lowerNoun = noun.lowercaseString;
+    NSString *openedTitle = nil;
+    NSString *failureTitle = nil;
+    switch ((SPKGallerySource)file.source) {
+    case SPKGallerySourceStories:
+        openedTitle = SPKL(@"GALLERY_OPENED_ORIGINAL_STORY_TOAST");
+        failureTitle = SPKL(@"GALLERY_UNABLE_OPEN_ORIGINAL_STORY_TOAST");
+        break;
+    case SPKGallerySourceReels:
+        openedTitle = SPKL(@"GALLERY_OPENED_ORIGINAL_REEL_TOAST");
+        failureTitle = SPKL(@"GALLERY_UNABLE_OPEN_ORIGINAL_REEL_TOAST");
+        break;
+    default:
+        openedTitle = SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_OPENED_ORIGINAL_POST_TEXT");
+        failureTitle = SPKL(@"GALLERY_UNABLE_OPEN_ORIGINAL_POST_TOAST");
+        break;
+    }
     __weak __typeof(self) weakSelf = self;
     // The Gallery stays up: the post is pushed over it, so it is still here when
     // the post is closed. Dismissing is only the fallback for a build where the
@@ -1339,13 +1539,13 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
                                                fromViewController:self
                                                    legacyFallback:^{
                                                        [weakSelf dismissGalleryForOriginOpenWithCompletion:^{
-                                                           SPKNotify(kSPKNotificationGalleryOpenOriginal, [NSString stringWithFormat:@"Opened %@", lowerNoun], nil, @"external_link", SPKNotificationToneInfo);
+                                                           SPKNotify(kSPKNotificationGalleryOpenOriginal, openedTitle, nil, @"external_link", SPKNotificationToneInfo);
                                                        }];
                                                    }
                                                         onDismiss:nil]) {
         // Nothing to announce: the post is on screen.
     } else {
-        [self showGalleryOpenFailureMessage:[NSString stringWithFormat:@"Unable to open %@", lowerNoun] actionIdentifier:kSPKNotificationGalleryOpenOriginal];
+        [self showGalleryOpenFailureMessage:failureTitle actionIdentifier:kSPKNotificationGalleryOpenOriginal];
     }
 }
 
@@ -1360,9 +1560,9 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
                                                   if (success) {
                                                       // Quiet when a link was just made: that toast already said it.
                                                       if (!didLink)
-                                                          SPKNotify(kSPKNotificationGalleryOpenProfile, @"Opened profile", nil, @"user_circle", SPKNotificationToneForIconResource(@"user_circle"));
+                                                          SPKNotify(kSPKNotificationGalleryOpenProfile, SPKL(@"COMMON_OPENED_PROFILE_TOAST"), nil, @"user_circle", SPKNotificationToneForIconResource(@"user_circle"));
                                                   } else {
-                                                      [weakSelf showGalleryOpenFailureMessage:@"Unable to open profile" actionIdentifier:kSPKNotificationGalleryOpenProfile];
+                                                      [weakSelf showGalleryOpenFailureMessage:SPKL(@"COMMON_UNABLE_OPEN_PROFILE_TOAST") actionIdentifier:kSPKNotificationGalleryOpenProfile];
                                                   }
                                               }];
 }
@@ -1599,15 +1799,15 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
         return;
     }
 
-    NSString *message = [NSString stringWithFormat:@"This will permanently remove %ld file%@ from the gallery.", (long)files.count, files.count == 1 ? @"" : @"s"];
+    NSString *message = [NSString stringWithFormat:SPKL(@"GALLERY_GALLERY_PERMANENTLY_REMOVE_VALUE_FILE_VALUE_GALLERY_FORMAT"), SPKLP(@"COMMON_FILE_COUNT", files.count)];
     [SPKIGAlertPresenter presentAlertFromViewController:self
-                                                  title:@"Delete Selected Files?"
+                                                  title:SPKL(@"GALLERY_GALLERY_DELETE_SELECTED_FILES_CONFIRMATION_MESSAGE")
                                                 message:message
                                                 actions:@[
-                                                    [SPKIGAlertAction actionWithTitle:@"Cancel"
+                                                    [SPKIGAlertAction actionWithTitle:SPKL(@"ALERT_ACTION_CANCEL")
                                                                                 style:SPKIGAlertActionStyleCancel
                                                                               handler:nil],
-                                                    [SPKIGAlertAction actionWithTitle:@"Delete"
+                                                    [SPKIGAlertAction actionWithTitle:SPKL(@"ALERT_ACTION_DELETE")
                                                                                 style:SPKIGAlertActionStyleDestructive
                                                                               handler:^{
                                                                                   NSError *firstError = nil;
@@ -1619,10 +1819,10 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
                                                                                       }
                                                                                   }
                                                                                   if (firstError) {
-                                                                                      SPKNotify(kSPKNotificationGalleryDeleteSelected, @"Failed to delete", firstError.localizedDescription, @"error_filled", SPKNotificationToneError);
+                                                                                      SPKNotify(kSPKNotificationGalleryDeleteSelected, SPKL(@"COMMON_DELETE_FAILED_TOAST"), firstError.localizedDescription, @"error_filled", SPKNotificationToneError);
                                                                                       return;
                                                                                   }
-                                                                                  SPKNotify(kSPKNotificationGalleryDeleteSelected, @"Deleted selected files", nil, @"circle_check_filled", SPKNotificationToneSuccess);
+                                                                                  SPKNotify(kSPKNotificationGalleryDeleteSelected, SPKL(@"GALLERY_GALLERY_DELETED_SELECTED_FILES_TEXT"), nil, @"circle_check_filled", SPKNotificationToneSuccess);
                                                                                   [self pruneStaleUsernameFilters];
                                                                                   [self exitSelectionMode];
                                                                               }],
@@ -1648,7 +1848,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 - (UIMenu *)fileActionsMenuForFile:(SPKGalleryFile *)file {
     __weak typeof(self) weakSelf = self;
 
-    NSString *favTitle = file.isFavorite ? @"Unfavorite" : @"Favorite";
+    NSString *favTitle = file.isFavorite ? SPKL(@"GALLERY_GALLERY_UNFAVORITE_TEXT") : SPKL(@"GALLERY_GALLERY_FAVORITE_TEXT");
     UIImage *favImg = file.isFavorite
                           ? SPKGalleryMenuActionIcon(@"heart_filled")
                           : SPKGalleryMenuActionIcon(@"heart");
@@ -1667,7 +1867,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
                                                  }];
 
     UIImage *editImg = SPKGalleryMenuActionIcon(@"edit");
-    UIAction *renameAction = [UIAction actionWithTitle:@"Edit Details"
+    UIAction *renameAction = [UIAction actionWithTitle:SPKL(@"ALERT_ACTION_EDIT_DETAILS")
                                                  image:editImg
                                             identifier:nil
                                                handler:^(UIAction *a) {
@@ -1675,7 +1875,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
                                                }];
 
     UIImage *moveImg = SPKGalleryMenuActionIcon(@"folder_move");
-    UIAction *moveAction = [UIAction actionWithTitle:@"Move to Folder"
+    UIAction *moveAction = [UIAction actionWithTitle:SPKL(@"ALERT_ACTION_MOVE_FOLDER")
                                                image:moveImg
                                           identifier:nil
                                              handler:^(UIAction *a) {
@@ -1684,7 +1884,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 
     UIAction *trimAction = nil;
     if (file.mediaType == SPKGalleryMediaTypeVideo || file.mediaType == SPKGalleryMediaTypeAudio) {
-        trimAction = [UIAction actionWithTitle:@"Trim"
+        trimAction = [UIAction actionWithTitle:SPKL(@"ALERT_ACTION_TRIM")
                                          image:SPKGalleryMenuActionIcon(@"trim")
                                     identifier:nil
                                        handler:^(__unused UIAction *a) {
@@ -1694,7 +1894,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 
     UIAction *editAction = nil;
     if (file.mediaType == SPKGalleryMediaTypeImage) {
-        editAction = [UIAction actionWithTitle:@"Edit"
+        editAction = [UIAction actionWithTitle:SPKL(@"ALERT_ACTION_EDIT")
                                          image:SPKGalleryMenuActionIcon(@"crop")
                                     identifier:nil
                                        handler:^(__unused UIAction *a) {
@@ -1703,7 +1903,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
     }
 
     UIImage *shareImg = SPKGalleryMenuActionIcon(@"share");
-    UIAction *shareAction = [UIAction actionWithTitle:@"Share"
+    UIAction *shareAction = [UIAction actionWithTitle:SPKL(@"ALERT_ACTION_SHARE")
                                                 image:shareImg
                                            identifier:nil
                                               handler:^(UIAction *a) {
@@ -1724,7 +1924,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 
     UIAction *openProfileAction = nil;
     if (file.hasOpenableProfile) {
-        openProfileAction = [UIAction actionWithTitle:@"Open Profile"
+        openProfileAction = [UIAction actionWithTitle:SPKL(@"ALERT_ACTION_OPEN_PROFILE")
                                                 image:SPKGalleryMenuActionIcon(@"user_circle")
                                            identifier:nil
                                               handler:^(__unused UIAction *a) {
@@ -1733,26 +1933,26 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
     }
 
     UIImage *deleteImg = SPKGalleryMenuActionIcon(@"trash");
-    UIAction *deleteAction = [UIAction actionWithTitle:@"Delete"
+    UIAction *deleteAction = [UIAction actionWithTitle:SPKL(@"ALERT_ACTION_DELETE")
                                                  image:deleteImg
                                             identifier:nil
                                                handler:^(UIAction *a) {
                                                    [SPKIGAlertPresenter presentAlertFromViewController:weakSelf
-                                                                                                 title:@"Delete from Gallery"
-                                                                                               message:@"This will permanently remove this file from the gallery."
+                                                                                                 title:SPKL(@"GALLERY_GALLERY_DELETE_GALLERY_TEXT")
+                                                                                               message:SPKL(@"GALLERY_GALLERY_PERMANENTLY_REMOVE_FILE_GALLERY_TEXT")
                                                                                                actions:@[
-                                                                                                   [SPKIGAlertAction actionWithTitle:@"Cancel"
+                                                                                                   [SPKIGAlertAction actionWithTitle:SPKL(@"ALERT_ACTION_CANCEL")
                                                                                                                                style:SPKIGAlertActionStyleCancel
                                                                                                                              handler:nil],
-                                                                                                   [SPKIGAlertAction actionWithTitle:@"Delete"
+                                                                                                   [SPKIGAlertAction actionWithTitle:SPKL(@"ALERT_ACTION_DELETE")
                                                                                                                                style:SPKIGAlertActionStyleDestructive
                                                                                                                              handler:^{
                                                                                                                                  NSError *err;
                                                                                                                                  [file removeWithError:&err];
                                                                                                                                  if (err) {
-                                                                                                                                     SPKNotify(kSPKNotificationGalleryDeleteFile, @"Failed to delete", err.localizedDescription, @"error_filled", SPKNotificationToneError);
+                                                                                                                                     SPKNotify(kSPKNotificationGalleryDeleteFile, SPKL(@"COMMON_DELETE_FAILED_TOAST"), err.localizedDescription, @"error_filled", SPKNotificationToneError);
                                                                                                                                  } else {
-                                                                                                                                     SPKNotify(kSPKNotificationGalleryDeleteFile, @"Deleted from Gallery", nil, @"circle_check_filled", SPKNotificationToneSuccess);
+                                                                                                                                     SPKNotify(kSPKNotificationGalleryDeleteFile, SPKL(@"GALLERY_DELETED_FROM_GALLERY_TOAST"), nil, @"circle_check_filled", SPKNotificationToneSuccess);
                                                                                                                                  }
                                                                                                                              }],
                                                                                                ]];
@@ -1764,7 +1964,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
     if (file.sourceUsername.length > 0) {
         NSString *username = [file.sourceUsername copy];
         BOOL isCurrentUsernameFilter = [self usernameFilterContainsUsername:username];
-        usernameAction = [UIAction actionWithTitle:[NSString stringWithFormat:@"%@ %@", (isCurrentUsernameFilter ? @"Undo View All from" : @"View All from"), username]
+        usernameAction = [UIAction actionWithTitle:[NSString stringWithFormat:@"%@ %@", (isCurrentUsernameFilter ? SPKL(@"GALLERY_GALLERY_UNDO_VIEW_TEXT") : SPKL(@"GALLERY_GALLERY_VIEW_TEXT")), username]
                                              image:SPKGalleryMenuActionIcon(@"mention")
                                         identifier:nil
                                            handler:^(__unused UIAction *a) {
@@ -1823,7 +2023,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 - (UIMenu *)folderActionsMenuForFolderPath:(NSString *)folderPath {
     __weak typeof(self) weakSelf = self;
     UIImage *folderRenameImg = SPKGalleryMenuActionIcon(@"edit");
-    UIAction *renameAction = [UIAction actionWithTitle:@"Rename Folder"
+    UIAction *renameAction = [UIAction actionWithTitle:SPKL(@"ALERT_ACTION_RENAME_FOLDER")
                                                  image:folderRenameImg
                                             identifier:nil
                                                handler:^(UIAction *a) {
@@ -1831,7 +2031,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
                                                }];
 
     UIImage *folderDeleteImg = SPKGalleryMenuActionIcon(@"trash");
-    UIAction *deleteAction = [UIAction actionWithTitle:@"Delete Folder"
+    UIAction *deleteAction = [UIAction actionWithTitle:SPKL(@"ALERT_ACTION_DELETE_FOLDER")
                                                  image:folderDeleteImg
                                             identifier:nil
                                                handler:^(UIAction *a) {
@@ -1847,13 +2047,13 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 
 - (void)presentCreateFolder {
     [SPKIGAlertPresenter presentTextInputAlertFromViewController:self
-                                                           title:@"New Folder"
+                                                           title:SPKL(@"GALLERY_GALLERY_NEW_FOLDER_TEXT")
                                                          message:@""
-                                                     placeholder:@"Folder name"
+                                                     placeholder:SPKL(@"VC_PLACEHOLDER_FOLDER_NAME")
                                                      initialText:nil
                                                  autocapitalized:YES
-                                                    confirmTitle:@"Create"
-                                                     cancelTitle:@"Cancel"
+                                                    confirmTitle:SPKL(@"TAB_CREATE")
+                                                     cancelTitle:SPKL(@"VC_BTN_CANCEL")
                                                     confirmStyle:SPKIGAlertActionStyleDefault
                                                     confirmBlock:^(NSString *text) {
                                                         NSString *name = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -1908,13 +2108,13 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 
 - (void)renameFolder:(NSString *)folderPath {
     [SPKIGAlertPresenter presentTextInputAlertFromViewController:self
-                                                           title:@"Rename Folder"
-                                                         message:@"Enter a new name for this folder."
+                                                           title:SPKL(@"ALERT_ACTION_RENAME_FOLDER")
+                                                         message:SPKL(@"GALLERY_GALLERY_ENTER_NEW_NAME_FOLDER_TEXT")
                                                      placeholder:nil
                                                      initialText:[folderPath lastPathComponent]
                                                  autocapitalized:YES
-                                                    confirmTitle:@"Rename"
-                                                     cancelTitle:@"Cancel"
+                                                    confirmTitle:SPKL(@"GALLERY_GALLERY_RENAME_TEXT")
+                                                     cancelTitle:SPKL(@"VC_BTN_CANCEL")
                                                     confirmStyle:SPKIGAlertActionStyleDefault
                                                     confirmBlock:^(NSString *text) {
                                                         NSString *newName = [text stringByTrimmingCharactersInSet:
@@ -1977,17 +2177,18 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
     NSInteger count = [ctx countForFetchRequest:req error:nil];
 
     NSString *msg = count == 0
-                        ? @"This folder is empty."
-                        : [NSString stringWithFormat:@"This folder contains %ld file(s). They will be moved to the parent folder.", (long)count];
+                        ? SPKL(@"GALLERY_GALLERY_FOLDER_EMPTY_TEXT")
+                        : [NSString stringWithFormat:SPKL(@"GALLERY_FOLDER_DELETE_CONTENTS_MOVE_MESSAGE_FORMAT"),
+                                                       SPKLP(@"COMMON_FILE_COUNT", count)];
 
     [SPKIGAlertPresenter presentAlertFromViewController:self
-                                                  title:@"Delete Folder?"
+                                                  title:SPKL(@"GALLERY_GALLERY_DELETE_FOLDER_CONFIRMATION_MESSAGE")
                                                 message:msg
                                                 actions:@[
-                                                    [SPKIGAlertAction actionWithTitle:@"Cancel"
+                                                    [SPKIGAlertAction actionWithTitle:SPKL(@"ALERT_ACTION_CANCEL")
                                                                                 style:SPKIGAlertActionStyleCancel
                                                                               handler:nil],
-                                                    [SPKIGAlertAction actionWithTitle:@"Delete"
+                                                    [SPKIGAlertAction actionWithTitle:SPKL(@"ALERT_ACTION_DELETE")
                                                                                 style:SPKIGAlertActionStyleDestructive
                                                                               handler:^{
                                                                                   [self performDeleteFolder:folderPath];
@@ -2047,7 +2248,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
 - (void)trimFile:(SPKGalleryFile *)file {
     NSURL *url = [file fileURL];
     if (!url || ![[NSFileManager defaultManager] fileExistsAtPath:url.path]) {
-        SPKNotify(@"spk.trim.gallery", @"Cannot trim", @"The original file is missing.", @"error_filled", SPKNotificationToneError);
+        SPKNotify(@"spk.trim.gallery", SPKL(@"MEDIA_TRIM_CANNOT_TRIM_TOAST"), SPKL(@"MEDIA_TRIM_ORIGINAL_FILE_MISSING_TOAST"), @"error_filled", SPKNotificationToneError);
         return;
     }
     SPKTrimConfiguration *config = (file.mediaType == SPKGalleryMediaTypeAudio)
@@ -2069,7 +2270,7 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
                           ? [UIImage imageWithContentsOfFile:url.path]
                           : nil;
     if (!source) {
-        SPKNotify(@"spk.photoedit.gallery", @"Cannot Edit", @"The original file is missing.", @"error_filled", SPKNotificationToneError);
+        SPKNotify(@"spk.photoedit.gallery", SPKL(@"GALLERY_GALLERY_CANNOT_EDIT_TEXT"), SPKL(@"MEDIA_TRIM_ORIGINAL_FILE_MISSING_TOAST"), @"error_filled", SPKNotificationToneError);
         return;
     }
     __weak typeof(self) weakSelf = self;
@@ -2159,17 +2360,17 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
                                                      }]];
     }
 
-    [actions addObject:[SPKIGAlertAction actionWithTitle:@"New folder..."
+    [actions addObject:[SPKIGAlertAction actionWithTitle:SPKL(@"ALERT_ACTION_NEW_FOLDER")
                                                    style:SPKIGAlertActionStyleDefault
                                                  handler:^{
                                                      [SPKIGAlertPresenter presentTextInputAlertFromViewController:self
-                                                                                                            title:@"New Folder"
-                                                                                                          message:@"Enter a new folder name, then move the selected files there."
-                                                                                                      placeholder:@"Folder name"
+                                                                                                            title:SPKL(@"GALLERY_GALLERY_NEW_FOLDER_TEXT")
+                                                                                                          message:SPKL(@"GALLERY_GALLERY_ENTER_NEW_FOLDER_NAME_THEN_MOVE_SELECTED_FILES_THERE_TEXT")
+                                                                                                      placeholder:SPKL(@"VC_PLACEHOLDER_FOLDER_NAME")
                                                                                                       initialText:nil
                                                                                                   autocapitalized:NO
-                                                                                                     confirmTitle:@"Create & Move"
-                                                                                                      cancelTitle:@"Cancel"
+                                                                                                     confirmTitle:SPKL(@"GALLERY_GALLERY_CREATE_MOVE_TEXT")
+                                                                                                      cancelTitle:SPKL(@"VC_BTN_CANCEL")
                                                                                                      confirmStyle:SPKIGAlertActionStyleDefault
                                                                                                      confirmBlock:^(NSString *text) {
                                                                                                          NSString *name = [text stringByTrimmingCharactersInSet:
@@ -2182,15 +2383,15 @@ typedef NS_ENUM(NSInteger, SPKGalleryViewMode) {
                                                                                                       cancelBlock:nil];
                                                  }]];
 
-    [actions addObject:[SPKIGAlertAction actionWithTitle:@"Cancel" style:SPKIGAlertActionStyleCancel handler:nil]];
+    [actions addObject:[SPKIGAlertAction actionWithTitle:SPKL(@"ALERT_ACTION_CANCEL") style:SPKIGAlertActionStyleCancel handler:nil]];
 
-    NSString *message = @"Choose where to move the selected file(s).";
+    NSString *message = SPKL(@"GALLERY_GALLERY_CHOOSE_MOVE_SELECTED_FILE_S_TEXT");
     if (sharesCurrentFolder) {
         NSString *currentName = currentFolder.length > 0 ? [currentFolder lastPathComponent] : @"/";
-        message = [NSString stringWithFormat:@"Currently in %@. Choose where to move the selected file(s).", currentName];
+        message = [NSString stringWithFormat:SPKL(@"GALLERY_GALLERY_CURRENTLY_VALUE_CHOOSE_MOVE_SELECTED_FILE_S_FORMAT"), currentName];
     }
     [SPKIGAlertPresenter presentActionSheetFromViewController:self
-                                                        title:@"Move to Folder"
+                                                        title:SPKL(@"ALERT_ACTION_MOVE_FOLDER")
                                                       message:message
                                                       actions:actions
                                                    forceSheet:YES];

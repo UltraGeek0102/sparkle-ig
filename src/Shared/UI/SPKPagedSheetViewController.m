@@ -1,3 +1,4 @@
+#import "SPKStrings.h"
 #import "SPKPagedSheetViewController.h"
 #import <QuartzCore/QuartzCore.h>
 #import "../../AssetUtils.h"
@@ -136,8 +137,8 @@
 #pragma mark - Subclass hooks (defaults)
 
 - (NSArray<SPKPagedSheetPage *> *)buildPages { return @[]; }
-- (NSString *)continueButtonTitle { return @"Continue"; }
-- (NSString *)finishButtonTitle { return @"Get Started"; }
+- (NSString *)continueButtonTitle { return SPKL(@"ALERT_ACTION_CONTINUE"); }
+- (NSString *)finishButtonTitle { return SPKL(@"UI_PAGED_SHEET_GET_STARTED_TEXT"); }
 - (BOOL)allowsInteractiveDismiss { return NO; }
 
 #pragma mark - Presentation
@@ -180,6 +181,7 @@
     self.pageControl.currentPageIndicatorTintColor = [SPKUtils SPKColor_InstagramBlue];
     self.pageControl.pageIndicatorTintColor = [SPKUtils SPKColor_InstagramSeparator];
     self.pageControl.userInteractionEnabled = NO;
+    self.pageControl.hidesForSinglePage = YES;
     self.pageControl.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:self.pageControl];
 
@@ -189,7 +191,7 @@
     [self.view addSubview:self.primaryButton];
 
     self.skipButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.skipButton setTitle:@"Skip" forState:UIControlStateNormal];
+    [self.skipButton setTitle:SPKL(@"VC_BTN_SKIP") forState:UIControlStateNormal];
     [self.skipButton setTitleColor:[SPKUtils SPKColor_InstagramSecondaryText] forState:UIControlStateNormal];
     self.skipButton.titleLabel.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightMedium];
     self.skipButton.translatesAutoresizingMaskIntoConstraints = NO;
@@ -221,6 +223,13 @@
         [self.skipButton.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-10.0],
         [self.skipButton.heightAnchor constraintEqualToConstant:32.0],
     ]];
+
+    // hidesForSinglePage only stops the dots being drawn; the control still
+    // reserves its intrinsic height in Auto Layout, leaving an empty strip above
+    // the button. A single-page sheet has nothing to page through, so collapse it.
+    if (self.pages.count <= 1) {
+        [self.pageControl.heightAnchor constraintEqualToConstant:0.0].active = YES;
+    }
 
     [self layoutPages];
     [self updateControlsForPage:0];
@@ -332,7 +341,17 @@
     static const CGFloat kIconSize = 24.0;
 
     UIImage *glyph = nil;
-    if (iconName.length > 0) {
+    NSString *fallbackSymbol = entry[@"symbol"];
+    if (iconName.length > 0 && fallbackSymbol.length > 0) {
+        // Glyphs missing from older Instagram builds fall back to the entry's SF Symbol
+        // instead of the generic placeholder.
+        glyph = [SPKAssetUtils resolvedImageNamed:iconName
+                               fallbackSystemName:fallbackSymbol
+                                        pointSize:0
+                                           weight:UIImageSymbolWeightSemibold
+                                           source:SPKResolvedImageSourceInstagramIcon
+                                    renderingMode:UIImageRenderingModeAlwaysTemplate];
+    } else if (iconName.length > 0) {
         // Load the pristine catalog image at native size (pointSize 0 = no rasterising
         // downscale), the same path menuIconNamed: relies on. Forcing a smaller point
         // size routes vector-backed (.svg) glyphs through a renderer downscale that

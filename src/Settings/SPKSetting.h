@@ -15,6 +15,10 @@ typedef NS_ENUM(NSInteger, SPKTableCell) {
     SPKTableCellValue,
 };
 
+/// Posted on the main thread when a value behind some row's `accessoryTextProvider`
+/// has changed, so open settings pages reload the rows that show one.
+FOUNDATION_EXPORT NSNotificationName const SPKSettingAccessoryTextDidChangeNotification;
+
 ///
 
 @interface SPKSetting : NSObject
@@ -23,6 +27,14 @@ typedef NS_ENUM(NSInteger, SPKTableCell) {
 
 @property (nonatomic, strong) NSString *title;
 @property (nonatomic, strong) NSString *subtitle;
+
+/// One sentence explaining what this row does, shown in the section's info
+/// sheet under the row's own icon and title. A section whose rows carry help
+/// text gets an info button on its header and drops its text footer.
+///
+/// The sheet prints the title above this text, so help that merely restates the
+/// title reads twice. Leave it nil on those rows: they are simply absent.
+@property (nonatomic, copy, nullable) NSString *helpText;
 
 @property (nonatomic, strong, nullable) UIImage *icon;
 @property (nonatomic, strong, nullable) UIColor *iconTintColor;
@@ -76,12 +88,23 @@ typedef NS_ENUM(NSInteger, SPKTableCell) {
 
 @property (nonatomic, strong) NSArray *navSections;
 @property (nonatomic, strong) UIViewController *navViewController;
+
+/// Optional gate on a navigation row: the push happens only if the block calls its
+/// `allow` continuation. For destinations behind a lock, so the prompt appears on the
+/// row tap rather than over a screen that is already open.
+@property (nonatomic, copy, nullable) void (^navigationGate)(void (^allow)(void));
 @property (nonatomic, copy, nullable) NSArray * (^searchSectionsProvider)(void);
 @property (nonatomic, copy, nullable) NSString *searchKeywords;
 
 + (instancetype)staticCellWithTitle:(NSString *)title
                            subtitle:(NSString *)subtitle
                                icon:(nullable UIImage *)icon;
+
+/// Leading image loaded from `imageUrl` and cached, circular unless the row's
+/// `userInfo` carries `@{@"remoteImageCircular": @NO}`.
++ (instancetype)staticCellWithTitle:(NSString *)title
+                           subtitle:(NSString *)subtitle
+                           imageUrl:(NSString *)imageUrl;
 
 + (instancetype)linkCellWithTitle:(NSString *)title
                          subtitle:(NSString *)subtitle

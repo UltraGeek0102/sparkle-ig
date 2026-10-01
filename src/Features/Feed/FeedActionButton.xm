@@ -1,3 +1,4 @@
+#import "SPKStrings.h"
 #import <objc/message.h>
 #import <objc/runtime.h>
 
@@ -36,6 +37,34 @@ static BOOL SPKFeedShouldSuppressNativeLongPressFromHandler(id handler, UIGestur
 @implementation SPKFeedExpandLongPressDelegate
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
     return SPKFeedShouldSuppressNativeLongPress(gestureRecognizer);
+}
+
+// Reels shown in feed draw their author header (avatar, username, follow) inside
+// the cell the expand recognizer is attached to. Without this the 0.3s expand
+// press wins over the avatar's own long press, so story peek and profile photo
+// zoom never fire there. Leave touches that land on such targets to their owners.
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    UIView *host = gestureRecognizer.view;
+    CGFloat hostArea = CGRectGetWidth(host.bounds) * CGRectGetHeight(host.bounds);
+    for (UIView *view = touch.view; view && view != host; view = view.superview) {
+        if ([view isKindOfClass:[UIControl class]])
+            return NO;
+
+        NSString *className = NSStringFromClass([view class]);
+        for (NSString *fragment in @[ @"Avatar", @"ProfilePic", @"StoryRing", @"Header" ]) {
+            if ([className rangeOfString:fragment].location != NSNotFound)
+                return NO;
+        }
+
+        CGFloat area = CGRectGetWidth(view.bounds) * CGRectGetHeight(view.bounds);
+        if (hostArea <= 0 || area >= hostArea * 0.25)
+            continue;
+        for (UIGestureRecognizer *other in view.gestureRecognizers) {
+            if (other.enabled && [other isKindOfClass:[UILongPressGestureRecognizer class]])
+                return NO;
+        }
+    }
+    return YES;
 }
 @end
 
@@ -704,7 +733,7 @@ static void SPKHandleFeedExpandLongPress(UIView *view, UILongPressGestureRecogni
             NSInteger index = SPKFeedCarouselPageIndexFromView(view);
             if (index < 0 || index >= (NSInteger)items.count)
                 index = 0;
-            SPKNotify(kSPKActionExpand, @"Expanded media", nil, @"expand", SPKNotificationToneForIconResource(@"expand"));
+            SPKNotify(kSPKActionExpand, SPKL(@"FEED_FEED_ACTION_BUTTON_EXPANDED_MEDIA_TEXT"), nil, @"expand", SPKNotificationToneForIconResource(@"expand"));
             [SPKFullScreenMediaPlayer showMediaItems:items
                                      startingAtIndex:index
                                             metadata:metadata
@@ -730,7 +759,7 @@ static void SPKHandleFeedExpandLongPress(UIView *view, UILongPressGestureRecogni
     if (username.length > 0)
         item.title = username;
 
-    SPKNotify(kSPKActionExpand, @"Expanded media", nil, @"expand", SPKNotificationToneForIconResource(@"expand"));
+    SPKNotify(kSPKActionExpand, SPKL(@"FEED_FEED_ACTION_BUTTON_EXPANDED_MEDIA_TEXT"), nil, @"expand", SPKNotificationToneForIconResource(@"expand"));
     [SPKFullScreenMediaPlayer showMediaItems:@[ item ]
                              startingAtIndex:0
                                     metadata:metadata

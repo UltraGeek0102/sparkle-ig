@@ -519,6 +519,11 @@ void SPKStoryApplyDynamicRangeToButton(UIButton *button) {
 
     if (!tint) tint = UIColor.whiteColor;
 
+    // This runs from layout callbacks, several times per frame per button, so
+    // only the transitions are worth logging.
+    UIColor *previousTint = button.tintColor;
+    BOOL tintChanged = ![previousTint isEqual:tint];
+
     button.tintAdjustmentMode = UIViewTintAdjustmentModeNormal;
     button.adjustsImageWhenHighlighted = NO;
     button.tintColor = tint;
@@ -532,5 +537,44 @@ void SPKStoryApplyDynamicRangeToButton(UIButton *button) {
     UIImageView *imageView = button.imageView;
     spkApplyEDRTintToImageView(imageView, tint);
 
-    SPKLog(@"Stories", @"[EDR] Applied EDR tint to button (tag=%ld)", (long)button.tag);
+    if (tintChanged)
+        SPKLog(@"Stories", @"[EDR] Applied EDR tint to button (tag=%ld)", (long)button.tag);
+}
+
+UIColor *SPKStoryDynamicRangeAccentTint(UIButton *button, UIColor *color) {
+    UIColor *reference = [button isKindOfClass:[SPKChromeButton class]] ? ((SPKChromeButton *)button).iconTint : button.tintColor;
+    if (!color || !spkColorIsExtendedRange(reference))
+        return color;
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceExtendedSRGB);
+    if (!colorSpace)
+        return color;
+
+    // The EDR white tint is a uniform gain over 1.0; its brightest component is
+    // that gain, and scaling the accent by it keeps both buttons equally bright.
+    CGFloat headroom = 1.0;
+    CGColorRef referenceRef = CGColorCreateCopyByMatchingToColorSpace(colorSpace, kCGRenderingIntentDefault, reference.CGColor, NULL);
+    if (referenceRef) {
+        const CGFloat *components = CGColorGetComponents(referenceRef);
+        if (components && CGColorGetNumberOfComponents(referenceRef) >= 3)
+            headroom = MAX(components[0], MAX(components[1], components[2]));
+        CGColorRelease(referenceRef);
+    }
+
+    UIColor *result = color;
+    CGColorRef accentRef = headroom > 1.001 ? CGColorCreateCopyByMatchingToColorSpace(colorSpace, kCGRenderingIntentDefault, color.CGColor, NULL) : NULL;
+    if (accentRef) {
+        const CGFloat *components = CGColorGetComponents(accentRef);
+        if (components && CGColorGetNumberOfComponents(accentRef) >= 4) {
+            CGFloat scaled[] = { components[0] * headroom, components[1] * headroom, components[2] * headroom, components[3] };
+            CGColorRef scaledRef = CGColorCreate(colorSpace, scaled);
+            if (scaledRef) {
+                result = [UIColor colorWithCGColor:scaledRef];
+                CGColorRelease(scaledRef);
+            }
+        }
+        CGColorRelease(accentRef);
+    }
+    CGColorSpaceRelease(colorSpace);
+    return result;
 }

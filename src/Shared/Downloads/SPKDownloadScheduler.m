@@ -1,3 +1,4 @@
+#import "SPKStrings.h"
 #import "SPKDownloadScheduler.h"
 
 #import "../../Utils.h"
@@ -10,6 +11,7 @@
 #import "SPKDownloadHelpers.h"
 #import "SPKDownloadPresenter.h"
 #import "SPKDownloadStore.h"
+#import "SPKDownloadBackgroundKeeper.h"
 #import "SPKDownloadTransfer.h"
 
 @interface SPKDownloadActiveTransfer : NSObject
@@ -140,6 +142,14 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
     return stagedPath;
 }
 
+static int64_t SPKFileSizeAtPath(NSString *path) {
+    if (!path.length)
+        return 0;
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    int64_t size = [attrs[NSFileSize] longLongValue];
+    return size > 0 ? size : 0;
+}
+
 @implementation SPKDownloadScheduler
 
 - (instancetype)init {
@@ -226,7 +236,30 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                                                           }];
         [[NSNotificationCenter defaultCenter] postNotificationName:SPKDownloadServiceDidChangeNotification object:self];
         [self.presenter handleJobSnapshot:snapshot];
+        [self updateBackgroundKeepAliveForJob:snapshot];
     });
+}
+
+// Every item mutation funnels through notifyJob:, so this is the one place that
+// has to tell the keeper whether anything is still running. The notified job
+// answers the question on its own whenever it still has work, which is the case
+// for every progress tick; only a job that just went quiet costs a full scan.
+- (void)updateBackgroundKeepAliveForJob:(SPKDownloadJob *)snapshot {
+    if (snapshot && SPKDownloadJobHasInFlightItems(snapshot)) {
+        [SPKDownloadBackgroundKeeper.shared setHasActiveWork:YES];
+        return;
+    }
+    [SPKDownloadBackgroundKeeper.shared setHasActiveWork:[self hasInFlightWork]];
+}
+
+- (BOOL)hasInFlightWork {
+    @synchronized(self) {
+        for (SPKDownloadJob *job in self.jobs) {
+            if (SPKDownloadJobHasInFlightItems(job))
+                return YES;
+        }
+    }
+    return NO;
 }
 
 - (void)reportItemProgressForJobID:(NSString *)jobID
@@ -297,11 +330,6 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
 - (void)submitRequest:(SPKDownloadRequest *)request completion:(void (^)(NSString *, NSError *))completion {
     NSString *jobID = NSUUID.UUID.UUIDString;
     SPKDownloadJob *job = [[SPKDownloadJob alloc] initWithRequest:request jobID:jobID];
-    NSString *title = [SPKDownloadHelpers historyTitleForRequest:request];
-    if (!title.length) {
-        title = request.items.count > 1 ? @"Bulk download" : @"Media download";
-    }
-    job.title = title;
     @synchronized(self) {
         [self.jobs insertObject:job atIndex:0];
     }
@@ -319,7 +347,7 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                                               if (cancelled)
                                                   [strongSelf notifyJob:cancelled itemID:nil];
                                               if (completion)
-                                                  completion(nil, SPKDownloadError(SPKDownloadErrorCancelled, @"Download cancelled.", nil));
+                                                  completion(nil, SPKDownloadError(SPKDownloadErrorCancelled, SPKL(@"DOWNLOADS_SCHEDULER_DOWNLOAD_CANCELLED_ERROR"), nil));
                                               return;
                                           }
                                           if (result == SPKDownloadPreflightSkipSucceeded) {
@@ -335,7 +363,7 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                                                   if (isDuplicate) {
                                                       item.state = SPKDownloadStateSucceeded;
                                                       item.progress = 1.0;
-                                                      item.detail = @"Skipped duplicate";
+                                                      item.detail = SPKL(@"DOWNLOADS_DOWNLOAD_SCHEDULER_SKIPPED_DUPLICATE_TEXT");
                                                   } else {
                                                       [strongSelf transitionItemID:item.itemID jobID:jobID from:SPKDownloadStatePending to:SPKDownloadStateQueued update:nil];
                                                       queuedCount++;
@@ -392,6 +420,13 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
         [job recomputeDerivedState];
         [self notifyJob:job itemID:itemID];
         if (SPKDownloadStateIsTerminal(newState)) {
+            // Cancelled and interrupted items are deliberately not tallied: the
+            // finish notification reports work that ran to a conclusion, and a
+            // cancellation is already the user's own doing.
+            if (newState == SPKDownloadStateSucceeded || newState == SPKDownloadStateFailed) {
+                [SPKDownloadBackgroundKeeper.shared noteItemFinishedWithSuccess:(newState == SPKDownloadStateSucceeded)
+                                                                    destination:job.request.destination];
+            }
             [self.store persistJobs:[self allJobs] immediately:YES];
         } else {
             [self persist];
@@ -444,7 +479,7 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                           from:SPKDownloadStateQueued
                             to:SPKDownloadStateRunning
                         update:^(SPKDownloadMutableItemSnapshot *snap) {
-                            snap.detail = @"Preparing local file";
+                            snap.detail = SPKL(@"DOWNLOADS_DOWNLOAD_SCHEDULER_PREPARING_LOCAL_FILE_TEXT");
                             snap.progress = 0.5;
                         }];
         NSString *renamed = SPKRenameStagedPath(req.localSourcePath, item, job);
@@ -457,7 +492,7 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                       from:SPKDownloadStateQueued
                         to:SPKDownloadStateRunning
                     update:^(SPKDownloadMutableItemSnapshot *snap) {
-                        snap.detail = @"Downloading";
+                        snap.detail = SPKL(@"DOWNLOADS_DOWNLOAD_PRESENTER_DOWNLOADING_TEXT");
                         snap.progress = 0.05;
                     }];
     NSString *staging = [SPKDownloadStore stagingDirectoryForJobID:job.jobID];
@@ -483,7 +518,7 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                                                  snap.bytesWritten = written;
                                                  snap.totalBytesExpected = expected;
                                                  snap.progress = progress;
-                                                 snap.detail = @"Downloading";
+                                                 snap.detail = SPKL(@"DOWNLOADS_DOWNLOAD_PRESENTER_DOWNLOADING_TEXT");
                                              }];
         }
         completion:^(NSString *stagedPath, NSError *error) {
@@ -497,7 +532,7 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                                         from:SPKDownloadStateRunning
                                           to:SPKDownloadStateFailed
                                       update:^(SPKDownloadMutableItemSnapshot *snap) {
-                                          snap.error = error ?: SPKDownloadError(SPKDownloadErrorHTTPFailure, @"Download failed.", nil);
+                                          snap.error = error ?: SPKDownloadError(SPKDownloadErrorHTTPFailure, SPKL(@"DOWNLOADS_DOWNLOAD_SCHEDULER_DOWNLOAD_FAILED_TEXT"), nil);
                                           snap.progress = 1.0;
                                       }];
                 [strongSelf pumpQueue];
@@ -518,7 +553,7 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                           from:SPKDownloadStateQueued
                             to:SPKDownloadStateFailed
                         update:^(SPKDownloadMutableItemSnapshot *snap) {
-                            snap.error = SPKDownloadError(SPKDownloadErrorInvalidURL, @"Invalid media URL.", nil);
+                            snap.error = SPKDownloadError(SPKDownloadErrorInvalidURL, SPKL(@"DOWNLOADS_DOWNLOAD_SCHEDULER_INVALID_MEDIA_URL_TEXT"), nil);
                             snap.progress = 1.0;
                         }];
         [self pumpQueue];
@@ -530,7 +565,7 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                         to:SPKDownloadStateRunning
                     update:^(SPKDownloadMutableItemSnapshot *snap) {
                         snap.progress = 0.05;
-                        snap.detail = @"Preparing media";
+                        snap.detail = SPKL(@"DOWNLOADS_DOWNLOAD_SCHEDULER_PREPARING_MEDIA_TEXT");
                         snap.bytesWritten = 0;
                         snap.totalBytesExpected = 0;
                     }];
@@ -559,8 +594,17 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                                                block:^(SPKDownloadItem *snap) {
                                                    snap.progress = progress;
                                                    snap.detail = stageTitle;
-                                                   snap.bytesWritten = bytesWritten;
-                                                   snap.totalBytesExpected = totalBytesExpected;
+                                                   // Merge/transcode stages report (0, 0) — keep the
+                                                   // last known download byte counts so history and
+                                                   // the progress pill don't lose the size. The final
+                                                   // merged file size is stamped in finalizeItem.
+                                                   // Written and expected move together, so an
+                                                   // unknown-length track never pairs its bytes with
+                                                   // the previous track's total.
+                                                   if (bytesWritten > 0) {
+                                                       snap.bytesWritten = bytesWritten;
+                                                       snap.totalBytesExpected = MAX(totalBytesExpected, 0);
+                                                   }
                                                }];
             });
         }
@@ -619,7 +663,7 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                           from:SPKDownloadStateQueued
                             to:SPKDownloadStateFailed
                         update:^(SPKDownloadMutableItemSnapshot *snap) {
-                            snap.error = SPKDownloadError(SPKDownloadErrorInvalidURL, @"Invalid audio URL.", nil);
+                            snap.error = SPKDownloadError(SPKDownloadErrorInvalidURL, SPKL(@"DOWNLOADS_DOWNLOAD_SCHEDULER_INVALID_AUDIO_URL_TEXT"), nil);
                             snap.progress = 1.0;
                         }];
         [self pumpQueue];
@@ -631,7 +675,7 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                         to:SPKDownloadStateRunning
                     update:^(SPKDownloadMutableItemSnapshot *snap) {
                         snap.progress = 0.05;
-                        snap.detail = @"Downloading audio";
+                        snap.detail = SPKL(@"AUDIO_AUDIO_DOWNLOAD_COORDINATOR_DOWNLOADING_AUDIO_TEXT");
                     }];
     NSString *basename = req.audioProcessingBasename.length > 0 ? req.audioProcessingBasename : NSUUID.UUID.UUIDString;
     NSString *staging = [SPKDownloadStore stagingDirectoryForJobID:job.jobID];
@@ -676,7 +720,7 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                                                           from:SPKDownloadStateRunning
                                                             to:SPKDownloadStateFailed
                                                         update:^(SPKDownloadMutableItemSnapshot *snap) {
-                                                            snap.error = error ?: SPKDownloadError(SPKDownloadErrorHTTPFailure, @"Audio download failed.", nil);
+                                                            snap.error = error ?: SPKDownloadError(SPKDownloadErrorHTTPFailure, SPKL(@"DOWNLOADS_DOWNLOAD_SCHEDULER_AUDIO_DOWNLOAD_FAILED_TEXT"), nil);
                                                             snap.progress = 1.0;
                                                         }];
                                   [strongSelf pumpQueue];
@@ -686,9 +730,15 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                                                               itemID:itemID
                                                                block:^(SPKDownloadItem *snap) {
                                                                    snap.progress = 0.72;
-                                                                   snap.detail = @"Converting audio";
-                                                                   snap.bytesWritten = 0;
-                                                                   snap.totalBytesExpected = 0;
+                                                                   snap.detail = SPKL(@"AUDIO_AUDIO_DMUPLOAD_COORDINATOR_CONVERTING_AUDIO_TEXT");
+                                                                   // Keep the downloaded raw size visible during
+                                                                   // conversion; the converted size is stamped in
+                                                                   // finalizeItem.
+                                                                   int64_t rawSize = SPKFileSizeAtPath(rawURL.path);
+                                                                   if (rawSize > 0) {
+                                                                       snap.bytesWritten = rawSize;
+                                                                       snap.totalBytesExpected = rawSize;
+                                                                   }
                                                                }];
                               [SPKAudioDownloadCoordinator convertAudioAtURL:rawURL
                                   basename:basename
@@ -697,9 +747,7 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                                                                       itemID:itemID
                                                                        block:^(SPKDownloadItem *snap) {
                                                                            snap.progress = 0.72 + (convertProgress * 0.23);
-                                                                           snap.detail = title.length > 0 ? title : @"Converting audio";
-                                                                           snap.bytesWritten = 0;
-                                                                           snap.totalBytesExpected = 0;
+                                                                           snap.detail = title.length > 0 ? title : SPKL(@"AUDIO_AUDIO_DMUPLOAD_COORDINATOR_CONVERTING_AUDIO_TEXT");
                                                                        }];
                                   }
                                   completion:^(NSURL *outputURL, NSError *convertError) {
@@ -711,7 +759,7 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                                                                       from:SPKDownloadStateRunning
                                                                         to:SPKDownloadStateFailed
                                                                     update:^(SPKDownloadMutableItemSnapshot *snap) {
-                                                                        snap.error = convertError ?: SPKDownloadError(SPKDownloadErrorHTTPFailure, @"Audio conversion failed.", nil);
+                                                                        snap.error = convertError ?: SPKDownloadError(SPKDownloadErrorHTTPFailure, SPKL(@"DOWNLOADS_DOWNLOAD_SCHEDULER_AUDIO_CONVERSION_FAILED_TEXT"), nil);
                                                                         snap.progress = 1.0;
                                                                     }];
                                               [strongSelf pumpQueue];
@@ -752,6 +800,10 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
 }
 
 - (void)finalizeItem:(SPKDownloadItem *)item job:(SPKDownloadJob *)job stagedPath:(NSString *)stagedPath {
+    // Stamp the on-disk size: merged/transcoded outputs and local-source files
+    // never reported meaningful byte counts, so without this history shows no
+    // size for them. For plain downloads this matches the transferred bytes.
+    int64_t stagedSize = SPKFileSizeAtPath(stagedPath);
     [self transitionItemID:item.itemID
                      jobID:job.jobID
                       from:item.state
@@ -759,7 +811,11 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                     update:^(SPKDownloadMutableItemSnapshot *snap) {
                         snap.stagedPath = stagedPath;
                         snap.progress = 0.97;
-                        snap.detail = [NSString stringWithFormat:@"Saving to %@", SPKDownloadDestinationDisplayName(job.request.destination)];
+                        snap.detail = [NSString stringWithFormat:SPKL(@"AUTO_SAVE_AUTO_SAVE_SAVING_VALUE_FORMAT"), SPKDownloadDestinationDisplayName(job.request.destination)];
+                        if (stagedSize > 0) {
+                            snap.bytesWritten = stagedSize;
+                            snap.totalBytesExpected = stagedSize;
+                        }
                     }];
     __weak typeof(self) weakSelf = self;
     [self.destinationWriter finalizeFileAtPath:stagedPath
@@ -782,6 +838,13 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                                                                           snap.progress = 1.0;
                                                                       }];
                                             } else {
+                                                // Re-stamp from the final path in case the
+                                                // destination writer produced a different file
+                                                // (e.g. Gallery copy). Falls back to the staged
+                                                // size stamped on finalize entry.
+                                                int64_t finalSize = SPKFileSizeAtPath(finalPath);
+                                                if (finalSize <= 0)
+                                                    finalSize = stagedSize;
                                                 [strongSelf transitionItemID:item.itemID
                                                                        jobID:job.jobID
                                                                         from:SPKDownloadStateFinalizing
@@ -790,13 +853,99 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                                                                           snap.finalPath = finalPath;
                                                                           snap.photosAssetIdentifier = photosAssetID;
                                                                           snap.progress = 1.0;
-                                                                          snap.detail = @"Completed";
+                                                                          snap.detail = SPKL(@"DOWNLOADS_DOWNLOAD_SCHEDULER_COMPLETED_TEXT");
+                                                                          if (finalSize > 0) {
+                                                                              snap.bytesWritten = finalSize;
+                                                                              snap.totalBytesExpected = finalSize;
+                                                                          }
                                                                       }];
                                             }
                                             [strongSelf pumpQueue];
                                             [strongSelf trimHistory];
                                         });
                                     }];
+}
+
+- (nullable NSString *)recordCompletedFileAtURL:(nullable NSURL *)fileURL
+                                      mediaKind:(SPKDownloadMediaKind)kind
+                                    destination:(SPKDownloadDestination)destination
+                                       metadata:(nullable SPKGallerySaveMetadata *)metadata
+                                  sourceSurface:(SPKDownloadSourceSurface)surface
+                                      finalPath:(nullable NSString *)finalPath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL sourceExists = fileURL.isFileURL && [fm fileExistsAtPath:fileURL.path];
+    BOOL finalExists = finalPath.length > 0 && [fm fileExistsAtPath:finalPath];
+    if (!sourceExists && !finalExists)
+        return nil;
+
+    NSString *jobID = NSUUID.UUID.UUIDString;
+    NSString *staging = [SPKDownloadStore stagingDirectoryForJobID:jobID];
+    [fm createDirectoryAtPath:staging withIntermediateDirectories:YES attributes:nil error:nil];
+
+    // Staged copy backs tap-to-preview, mirroring pipeline downloads. Never
+    // point the item's localSourcePath at the gallery/final file:
+    // SPKDeleteJobScratch deletes it when the entry leaves history.
+    NSString *stagedPath = nil;
+    if (sourceExists) {
+        NSString *ext = fileURL.pathExtension.length > 0 ? fileURL.pathExtension.lowercaseString : nil;
+        if (ext.length == 0) {
+            switch (kind) {
+            case SPKDownloadMediaKindVideo:
+                ext = @"mp4";
+                break;
+            case SPKDownloadMediaKindAudio:
+                ext = @"m4a";
+                break;
+            default:
+                ext = @"jpg";
+                break;
+            }
+        }
+        stagedPath = [staging stringByAppendingPathComponent:[NSUUID.UUID.UUIDString stringByAppendingPathExtension:ext]];
+        if (![fm copyItemAtPath:fileURL.path toPath:stagedPath error:nil])
+            stagedPath = nil;
+    }
+    int64_t fileSize = SPKFileSizeAtPath(stagedPath);
+    if (fileSize <= 0)
+        fileSize = SPKFileSizeAtPath(finalPath);
+    if (fileSize <= 0)
+        fileSize = SPKFileSizeAtPath(fileURL.path);
+
+    SPKDownloadItemRequest *itemRequest = [SPKDownloadItemRequest itemWithLocalPath:stagedPath ?: @"" mediaKind:kind];
+    if (stagedPath.length == 0)
+        itemRequest.localSourcePath = nil;
+    NSString *preferredExt = stagedPath.pathExtension.length > 0 ? stagedPath.pathExtension.lowercaseString
+                             : fileURL.pathExtension.length > 0 ? fileURL.pathExtension.lowercaseString
+                                                                : finalPath.pathExtension.lowercaseString;
+    if (preferredExt.length > 0)
+        itemRequest.preferredFileExtension = preferredExt;
+    itemRequest.metadata = metadata;
+    SPKDownloadRequest *request = [SPKDownloadRequest requestWithItems:@[ itemRequest ] destination:destination];
+    request.metadata = metadata;
+    request.sourceSurface = surface;
+    request.presentationMode = SPKDownloadPresentationModeQuiet;
+    request.duplicatePolicy = SPKDownloadDuplicatePolicyAlwaysDownload; // post-hoc record; never preflighted
+
+    SPKDownloadJob *job = [[SPKDownloadJob alloc] initWithRequest:request jobID:jobID];
+    @synchronized(self) {
+        for (SPKDownloadItem *item in job.mutableItems) {
+            item.state = SPKDownloadStateSucceeded;
+            item.progress = 1.0;
+            item.bytesWritten = fileSize;
+            item.totalBytesExpected = fileSize;
+            item.stagedPath = stagedPath;
+            item.finalPath = finalPath;
+            item.detail = SPKL(@"DOWNLOADS_DOWNLOAD_SCHEDULER_COMPLETED_TEXT");
+        }
+        job.updatedAt = NSDate.date.timeIntervalSince1970;
+        [job recomputeDerivedState];
+        [self.jobs insertObject:job atIndex:0];
+    }
+    [self trimHistory]; // also persists
+    SPKDownloadJob *snapshot = [self jobWithID:jobID];
+    if (snapshot)
+        [self notifyJob:snapshot itemID:nil];
+    return jobID;
 }
 
 - (void)cancelJobID:(NSString *)jobID {
@@ -845,12 +994,12 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
                            from:from
                              to:SPKDownloadStateCancelled
                          update:^(SPKDownloadMutableItemSnapshot *snap) {
-                             snap.error = SPKDownloadError(SPKDownloadErrorCancelled, @"Download cancelled.", nil);
+                             snap.error = SPKDownloadError(SPKDownloadErrorCancelled, SPKL(@"DOWNLOADS_SCHEDULER_DOWNLOAD_CANCELLED_ERROR"), nil);
                              snap.progress = 1.0;
-                             snap.detail = @"Cancelled";
+                             snap.detail = SPKL(@"DOWNLOADS_SCHEDULER_CANCELLED_LABEL");
                          }]) {
         item.state = SPKDownloadStateCancelled;
-        item.error = SPKDownloadError(SPKDownloadErrorCancelled, @"Download cancelled.", nil);
+        item.error = SPKDownloadError(SPKDownloadErrorCancelled, SPKL(@"DOWNLOADS_SCHEDULER_DOWNLOAD_CANCELLED_ERROR"), nil);
         item.progress = 1.0;
         item.detail = @"Cancelled";
         [job recomputeDerivedState];
@@ -899,10 +1048,17 @@ static NSString *SPKRenameStagedPath(NSString *stagedPath, SPKDownloadItem *item
 }
 
 - (void)clearFinishedHistory {
+    [self clearFinishedHistoryForAccountPK:nil];
+}
+
+- (void)clearFinishedHistoryForAccountPK:(NSString *)accountPK {
     @synchronized(self) {
         NSMutableArray *remaining = [NSMutableArray array];
         for (SPKDownloadJob *job in self.jobs) {
-            if (SPKDownloadJobHasInFlightItems(job)) {
+            BOOL belongsToScope = accountPK.length == 0 ||
+                                  job.ownerAccountPK.length == 0 ||
+                                  [job.ownerAccountPK isEqualToString:accountPK];
+            if (SPKDownloadJobHasInFlightItems(job) || !belongsToScope) {
                 [remaining addObject:job];
             } else {
                 SPKDeleteJobScratch(job);

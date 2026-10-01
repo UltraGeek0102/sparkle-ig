@@ -1,3 +1,4 @@
+#import "SPKStrings.h"
 #import <objc/runtime.h>
 
 #import "../../Shared/ActionButton/ActionButtonLookupUtils.h"
@@ -432,12 +433,12 @@ static NSURL *SPKShareURLFromView(UIView *view) {
 static NSString *SPKCopiedShareLinkTitleForURL(NSURL *url) {
     NSString *path = url.path.lowercaseString ?: @"";
     if ([path containsString:@"/stories/"])
-        return @"Copied story link";
+        return SPKL(@"GENERAL_SHARE_LONG_PRESS_COPY_COPIED_STORY_LINK_TEXT");
     if ([path containsString:@"/reel/"] || [path containsString:@"/reels/"])
-        return @"Copied reel link";
+        return SPKL(@"GENERAL_SHARE_LONG_PRESS_COPY_COPIED_REEL_LINK_TEXT");
     if ([path containsString:@"/p/"])
-        return @"Copied post link";
-    return @"Copied link";
+        return SPKL(@"GENERAL_SHARE_LONG_PRESS_COPY_COPIED_POST_LINK_TEXT");
+    return SPKL(@"GENERAL_SHARE_LONG_PRESS_COPY_COPIED_LINK_TEXT");
 }
 
 static void SPKCopyShareURLForView(UIView *view) {
@@ -453,7 +454,7 @@ static void SPKCopyShareURLForView(UIView *view) {
     }
     if (url.absoluteString.length == 0) {
         SPKLog(@"General", @"[Sparkle ShareCopy] Copy failed: no link found for view=%@", SPKShareDebugViewName(view));
-        SPKNotify(kSPKNotificationShareLongPressCopyLink, @"No link found", nil, @"error_filled", SPKNotificationToneError);
+        SPKNotify(kSPKNotificationShareLongPressCopyLink, SPKL(@"GENERAL_SHARE_LONG_PRESS_COPY_NO_LINK_FOUND_TEXT"), nil, @"error_filled", SPKNotificationToneError);
         return;
     }
     UIPasteboard.generalPasteboard.string = url.absoluteString;
@@ -513,8 +514,11 @@ static NSArray<UIView *> *SPKShareCandidateSubviews(UIView *root, NSInteger maxD
         [queue removeObjectAtIndex:0];
         UIView *view = entry[@"view"];
         NSInteger depth = [entry[@"depth"] integerValue];
-        if (view != root && SPKShareViewLooksLikeSendControl(view)) {
+        if (view != root && view.userInteractionEnabled && SPKShareViewLooksLikeSendControl(view)) {
+            // Outermost match only. The send glyph and label inside a matched
+            // control must stay untouched, or they start swallowing its taps.
             [matches addObject:view];
+            continue;
         }
         if (depth >= maxDepth)
             continue;
@@ -544,12 +548,18 @@ static void SPKInstallShareLongPressOnView(UIView *view) {
         [SPKShareCopyLongPressRecognizers() addObject:existingRecognizer];
         return;
     }
-    view.userInteractionEnabled = YES;
+    // Never force userInteractionEnabled: enabling it on a decorative subview of
+    // the send button makes that subview the hit-test target and the button's
+    // center stops receiving taps, even with the recognizer disabled.
+    if (!view.userInteractionEnabled)
+        return;
     UILongPressGestureRecognizer *gesture = [[UILongPressGestureRecognizer alloc] initWithTarget:view action:@selector(spk_copyShareLinkLongPressed:)];
-    gesture.minimumPressDuration = 0.22;
+    gesture.minimumPressDuration = 0.3;
     gesture.cancelsTouchesInView = YES;
-    gesture.delaysTouchesBegan = YES;
-    gesture.delaysTouchesEnded = YES;
+    // Delaying touches holds the button's tap back until the long press fails,
+    // which drops quick taps on the send button.
+    gesture.delaysTouchesBegan = NO;
+    gesture.delaysTouchesEnded = NO;
     gesture.enabled = SPKShareLongPressCopyEnabled();
     for (UIGestureRecognizer *existing in view.gestureRecognizers.copy) {
         if ([existing isKindOfClass:UILongPressGestureRecognizer.class] && existing != gesture) {

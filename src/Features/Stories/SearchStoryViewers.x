@@ -1,3 +1,4 @@
+#import "SPKStrings.h"
 #import "../../AssetUtils.h"
 #import "../../Shared/Stories/SPKStoryViewersSearchViewController.h"
 #import "../../Shared/UI/SPKChrome.h"
@@ -98,8 +99,8 @@ static NSString *SPKViewerMediaIDFromItem(id item) {
         return; // not a story viewer list header
 
     SPKChromeButton *button = objc_getAssociatedObject(vc, &kSPKSearchButtonKey);
-    if (button && button.superview)
-        return; // already placed on a header (this or another)
+    if (button.superview && button.superview != self)
+        return; // already placed on another header
 
     if (!button) {
         // SPKChromeButton keeps the glyph inside a secure canvas so it stays
@@ -114,22 +115,24 @@ static NSString *SPKViewerMediaIDFromItem(id item) {
         // Box sits flush to the trailing edge; nudge the glyph in so it lines up
         // with the trash / reply column instead of hugging the screen edge.
         button.iconOffset = UIOffsetMake(-6.0, 0.0);
-        button.accessibilityLabel = @"Search viewers";
-        button.translatesAutoresizingMaskIntoConstraints = NO;
+        button.accessibilityLabel = SPKL(@"STORIES_SEARCH_STORY_VIEWERS_SEARCH_VIEWERS_TEXT");
         [button addTarget:vc action:@selector(spk_openViewerSearch) forControlEvents:UIControlEventTouchUpInside];
         objc_setAssociatedObject(vc, &kSPKSearchButtonKey, button, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
-    // Attach (or re-attach after cell reuse) to this header, flush to the
-    // trailing edge and vertically centered with the right-hand button column.
-    [self addSubview:button];
-    [NSLayoutConstraint activateConstraints:@[
-        [button.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
-        [button.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
-        [button.widthAnchor constraintEqualToConstant:44.0],
-        [button.heightAnchor constraintEqualToConstant:44.0],
-    ]];
-    SPKLog(@"ViewerSearch", @"[Sparkle] Pinned search button to viewers header");
+    // The header lays out with frames and we run inside its layoutSubviews, so
+    // constraints added here would not resolve until some later layout pass (the
+    // glyph sat at the top-left until a screenshot or tap forced one). Position
+    // the button by frame on every pass instead: flush to the trailing edge and
+    // vertically centered with the right-hand button column.
+    if (button.superview != self) {
+        [self addSubview:button];
+        SPKLog(@"ViewerSearch", @"[Sparkle] Pinned search button to viewers header");
+    }
+    button.translatesAutoresizingMaskIntoConstraints = YES;
+    CGRect bounds = self.bounds;
+    button.frame = CGRectMake(CGRectGetMaxX(bounds) - 44.0, CGRectGetMidY(bounds) - 22.0, 44.0, 44.0);
+    [self bringSubviewToFront:button];
 }
 
 %end
@@ -148,7 +151,7 @@ static NSString *SPKViewerMediaIDFromItem(id item) {
         SPKLog(@"ViewerSearch", @"[Sparkle] Could not resolve media id from viewer list item");
         return;
     }
-    [SPKStoryViewersSearchViewController presentForMediaID:mediaID title:@"Story Viewers"];
+    [SPKStoryViewersSearchViewController presentForMediaID:mediaID title:SPKL(@"STORIES_SEARCH_STORY_VIEWERS_STORY_VIEWERS_TEXT")];
 }
 
 %end

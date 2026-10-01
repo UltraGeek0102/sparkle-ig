@@ -1,3 +1,4 @@
+#import "SPKStrings.h"
 #import <AVFoundation/AVFoundation.h>
 #import <Photos/Photos.h>
 #include <UIKit/UIKit.h>
@@ -44,23 +45,8 @@ static NSTimeInterval const kDismissFadeDuration = 0.18;
 
 // Absolute medium-style date ("8 Jul 2026") for the preview metadata overlay.
 static NSString *SPKPreviewMediumDateString(NSDate *date) {
-    if (!date)
-        return nil;
-    static NSDateFormatter *fmt;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        fmt = [[NSDateFormatter alloc] init];
-        fmt.dateStyle = NSDateFormatterMediumStyle;
-        fmt.timeStyle = NSDateFormatterNoStyle;
-    });
-    return [fmt stringFromDate:date];
+    return [SPKUtils spk_formattedDate:date includingYear:YES];
 }
-// The bottom toolbar is a real UIToolbar now, so the navigation controller
-// folds it into the safe area that AVPlayerViewController already respects. No
-// manual control inset is needed; keep it at zero so the scrubber sits just
-// above it.
-static CGFloat const kVideoPlayerControlBottomInset = 0.0;
-
 static UIImage *SPKGalleryPreviewMenuIcon(NSString *resourceName) {
     // menuIconNamed: avoids the UIGraphicsImageRenderer downscale that iOS 16's
     // UIMenu renders blank for vector-backed (.svg) glyphs. See SPKAssetUtils.
@@ -121,15 +107,15 @@ static NSString *SPKCopiedDownloadURLTitleForPlaybackSource(
     NSString *noun = nil;
     switch (playbackSource) {
     case SPKFullScreenPlaybackSourceStories:
-        noun = @"Story";
+        noun = SPKL(@"COMMON_MEDIA_TYPE_STORY");
         break;
     case SPKFullScreenPlaybackSourceReels:
-        noun = @"Reel";
+        noun = SPKL(@"COMMON_MEDIA_TYPE_REEL");
         break;
     case SPKFullScreenPlaybackSourceFeed:
-    case SPKFullScreenPlaybackSourceProfile:
-        noun = @"Post";
+        noun = SPKL(@"MESSAGES_DELETED_MESSAGES_MODELS_POST_TEXT");
         break;
+    case SPKFullScreenPlaybackSourceProfile:
     case SPKFullScreenPlaybackSourceDirect:
     case SPKFullScreenPlaybackSourceInstants:
     case SPKFullScreenPlaybackSourceUnknown:
@@ -138,11 +124,10 @@ static NSString *SPKCopiedDownloadURLTitleForPlaybackSource(
         break;
     }
 
-    NSString *urlWord = plural ? @"URLs" : @"URL";
+    NSString *urlWord = plural ? SPKL(@"ACTION_BUTTON_ACTION_BUTTON_CORE_URLS_TEXT") : SPKL(@"ACTION_BUTTON_ACTION_BUTTON_CORE_URL_TEXT");
     return noun.length > 0
-               ? [NSString
-                     stringWithFormat:@"%@ download %@ copied", noun, urlWord]
-               : [NSString stringWithFormat:@"Download %@ copied", urlWord];
+               ? [NSString stringWithFormat:SPKL(@"ACTION_BUTTON_SOURCE_DOWNLOAD_URL_COPIED_FORMAT"), noun, urlWord]
+               : [NSString stringWithFormat:SPKL(@"ACTION_BUTTON_DOWNLOAD_URL_COPIED_FORMAT"), urlWord];
 }
 
 static UIViewController *
@@ -240,6 +225,15 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 /// chrome is visible so the value survives a chrome toggle.
 @property (nonatomic, assign) UIEdgeInsets mediaContentBarInsets;
 
+/// Set while a page's video plays in a Picture in Picture window and this viewer
+/// has stepped off screen for it. The dismissal skipped its usual cleanup, so the
+/// pages (and the player the window is drawing) are still alive to be restored.
+@property (nonatomic, assign) BOOL pictureInPictureHandoffActive;
+/// Keeps the viewer alive while it is off screen for the window, and remembers
+/// what to present again when the restore button is pressed.
+@property (nonatomic, strong, nullable) SPKFullScreenMediaPlayer *pictureInPictureSelfRetain;
+@property (nonatomic, strong, nullable) UIViewController *pictureInPicturePresentation;
+
 /// The content insets actually applied right now: the bar heights while the
 /// chrome is visible, zero (full-screen) while it's hidden. Animated alongside
 /// the bar fade in toggleToolbar so the media expands/contracts smoothly.
@@ -255,6 +249,16 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 /// Bottom pin for the overlay, frozen to the toolbar-visible position so the overlay
 /// fades in place rather than sliding as the chrome (and its safe-area inset) moves.
 @property (nonatomic, strong, nullable) NSLayoutConstraint *infoOverlayBottomConstraint;
+/// Live Text is highlighting recognized text on the visible photo. VisionKit draws
+/// its "Copy All" quick action over the bottom of the image, from inside the page's
+/// own view hierarchy, so it lands underneath the info overlay in the exact same
+/// spot. Both cannot be readable at once; the info overlay yields.
+@property (nonatomic, assign) BOOL liveTextHighlightActive;
+/// Distance from the bottom of the player's view to the top of the action toolbar,
+/// captured while the chrome is visible. Pages anchor their own floating controls to
+/// it so they stay put when the chrome toggles instead of riding the safe area.
+@property (nonatomic, assign) CGFloat chromeBottomLimit;
+@property (nonatomic, assign) BOOL hasChromeBottomLimit;
 
 @end
 
@@ -321,7 +325,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     // rare and its page already shows the load-failure state, so let the page that
     // actually gets displayed discover it.
     NSInteger adjustedIndex = MAX(0, MIN(index, (NSInteger)files.count - 1));
-    SPKNotify(kSPKNotificationMediaPreviewOpenGallery, @"Opened Gallery media",
+    SPKNotify(kSPKNotificationMediaPreviewOpenGallery, SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_OPENED_GALLERY_MEDIA_TEXT"),
               nil, @"media", SPKNotificationToneInfo);
 
     SPKFullScreenMediaPlayer *player = [[SPKFullScreenMediaPlayer alloc] init];
@@ -614,7 +618,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 
     _infoOverlay = [[SPKMediaPreviewInfoOverlay alloc] initWithFrame:CGRectZero];
     _infoOverlay.translatesAutoresizingMaskIntoConstraints = NO;
-    _infoOverlay.alpha = _isToolbarVisible ? 1.0 : 0.0;
+    _infoOverlay.alpha = [self infoOverlayVisibleAlpha];
     [self.view addSubview:_infoOverlay];
     _infoOverlayBottomConstraint =
         [_infoOverlay.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor];
@@ -651,9 +655,56 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     }
 }
 
+// Same frozen measurement the info overlay uses, handed to the pages so their own
+// floating controls (the Live Text button) sit at a fixed height. Recomputed only
+// while the chrome is visible and settled, so toggling it never moves anything.
+- (void)updateChromeBottomLimitIfNeeded {
+    if (!_isToolbarVisible || self.chromeToggleInProgress)
+        return;
+
+    UIToolbar *toolbar = self.navigationController.toolbar;
+    CGFloat toolbarTopInView;
+    if (toolbar && !toolbar.hidden && toolbar.window) {
+        CGRect frameInView = [self.view convertRect:toolbar.bounds fromView:toolbar];
+        toolbarTopInView = CGRectGetMinY(frameInView);
+    } else {
+        toolbarTopInView =
+            CGRectGetMaxY(self.view.bounds) - self.view.safeAreaInsets.bottom;
+    }
+
+    CGFloat limit = MAX(0.0, CGRectGetMaxY(self.view.bounds) - toolbarTopInView);
+    if (_hasChromeBottomLimit && ABS(limit - _chromeBottomLimit) < 0.5)
+        return;
+    _chromeBottomLimit = limit;
+    _hasChromeBottomLimit = YES;
+    for (UIViewController *controller in self.pageViewController.viewControllers) {
+        [self applyChromeBottomLimitToController:controller];
+    }
+}
+
+- (void)applyChromeBottomLimitToController:(UIViewController *)controller {
+    if (!_hasChromeBottomLimit)
+        return;
+    if ([controller respondsToSelector:@selector(applyChromeBottomLimit:)]) {
+        [(id)controller applyChromeBottomLimit:_chromeBottomLimit];
+    }
+}
+
+// The overlay is visible only while the chrome is and Live Text is not drawing its
+// own quick action over the same corner.
+- (CGFloat)infoOverlayVisibleAlpha {
+    return (_isToolbarVisible && !_liveTextHighlightActive) ? 1.0 : 0.0;
+}
+
 - (void)refreshInfoOverlay {
     if (!_infoOverlay)
         return;
+    // A new page carries no highlight of its own; the page left behind keeps its
+    // VisionKit state but is no longer on screen.
+    if (_liveTextHighlightActive) {
+        _liveTextHighlightActive = NO;
+        _infoOverlay.alpha = [self infoOverlayVisibleAlpha];
+    }
 
     SPKMediaItem *item = [self currentItem];
     // Photos only — the video transport bar has no free space for it.
@@ -674,7 +725,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
         // subtitle "Posted <date> · Saved <date>".
         SPKGalleryFile *file = item.galleryFile;
         NSString *sourceLabel =
-            [SPKGalleryFile shortLabelForSource:(SPKGallerySource)meta.source];
+            [SPKGalleryFile labelForSource:(SPKGallerySource)meta.source];
         if (handle.length > 0 && sourceLabel.length > 0) {
             title = [NSString stringWithFormat:@"%@ · %@", handle, sourceLabel];
         } else {
@@ -693,11 +744,11 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
         // generator writes posted == saved when IG exposed no taken_at).
         if (postedDate &&
             (!savedDate || ABS([postedDate timeIntervalSinceDate:savedDate]) > 120.0)) {
-            [parts addObject:[NSString stringWithFormat:@"Posted %@",
+            [parts addObject:[NSString stringWithFormat:SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_POSTED_VALUE_FORMAT"),
                                                         SPKPreviewMediumDateString(postedDate)]];
         }
         if (savedDate) {
-            [parts addObject:[NSString stringWithFormat:@"Saved %@",
+            [parts addObject:[NSString stringWithFormat:SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_SAVED_VALUE_FORMAT"),
                                                         SPKPreviewMediumDateString(savedDate)]];
         }
         subtitle = [parts componentsJoinedByString:@" · "];
@@ -737,7 +788,8 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     SPKFullScreenVideoViewController *video = [self currentVideoViewController];
     if (!video)
         return;
-    self.pausedForNavigationAway = YES;
+    // A video the viewer already paused is not ours to resume.
+    self.pausedForNavigationAway = video.isPlaybackActive;
     [video pause];
 }
 
@@ -745,6 +797,8 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     [super viewDidLayoutSubviews];
     [self updateMediaContentBarInsetsIfNeeded];
     [self updateInfoOverlayPositionIfNeeded];
+    [self updateChromeBottomLimitIfNeeded];
+    [self updateCurrentVideoPlayerControlInsetsAnimated:NO];
 }
 
 // On non-notched devices the opaque top/bottom bars overlap edge-to-edge media,
@@ -836,13 +890,13 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 
 - (void)setupTopNavigationItems {
     UIBarButtonItem *closeItem = SPKMediaChromeTopBarButtonItemWithTint(
-        @"xmark", self, @selector(closeTapped), [UIColor labelColor], @"Close");
+        @"xmark", self, @selector(closeTapped), [UIColor labelColor], SPKL(@"COMMON_ACTION_CLOSE"));
     SPKMediaChromeSetLeadingTopBarItems(self.navigationItem, @[ closeItem ]);
 
     if (_isFromGallery) {
         _topFavoriteItem = SPKMediaChromeTopBarButtonItemWithTint(
             @"heart", self, @selector(favoriteTapped), [UIColor labelColor],
-            @"Favorite");
+            SPKL(@"GALLERY_GALLERY_FAVORITE_TEXT"));
     } else {
         _topFavoriteItem = nil;
     }
@@ -862,33 +916,39 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     SPKMediaChromeConfigureBottomToolbar(nav.toolbar);
 
     _savePhotosItem = SPKMediaChromeBottomBarButtonItem(
-        @"download", @"Save to Photos", self, @selector(saveToPhotos));
-    _shareItem = SPKMediaChromeBottomBarButtonItem(@"share", @"Share", self,
+        @"download", SPKL(@"FEED_COMMENT_ACTIONS_SAVE_PHOTOS_TEXT"), self, @selector(saveToPhotos));
+    _shareItem = SPKMediaChromeBottomBarButtonItem(@"share", SPKL(@"ALERT_ACTION_SHARE"), self,
                                                    @selector(shareMedia));
-    _clipboardItem = SPKMediaChromeBottomBarButtonItem(@"copy", @"Copy", self,
+    _clipboardItem = SPKMediaChromeBottomBarButtonItem(@"copy", SPKL(@"FEED_COMMENT_ACTIONS_COPY_TEXT"), self,
                                                        @selector(copyMedia));
-    _trimItem = SPKMediaChromeBottomBarButtonItem(@"trim", @"Trim", self,
+    _trimItem = SPKMediaChromeBottomBarButtonItem(@"trim", SPKL(@"ALERT_ACTION_TRIM"), self,
                                                   @selector(trimCurrentItem));
-    _editItem = SPKMediaChromeBottomBarButtonItem(@"crop", @"Edit", self,
+    _editItem = SPKMediaChromeBottomBarButtonItem(@"crop", SPKL(@"ALERT_ACTION_EDIT"), self,
                                                   @selector(editCurrentItem));
 
+    // The bulk actions menu sits in the top trailing corner: the bottom row is
+    // at its width limit where UIKit widens item slots.
     if (!_isFromGallery && [self itemCount] > 1) {
-        _bulkActionsItem =
-            SPKMediaChromeBottomBarButtonItem(@"more", @"Download All", nil, nil);
+        _bulkActionsItem = [[UIBarButtonItem alloc] initWithImage:SPKMediaChromeTopBarIcon(@"more")
+                                                            style:UIBarButtonItemStylePlain
+                                                           target:nil
+                                                           action:nil];
+        _bulkActionsItem.tintColor = [UIColor labelColor];
+        _bulkActionsItem.accessibilityLabel = SPKActionButtonTitleForIdentifier(kSPKActionDownloadAll);
     }
 
     if (_isFromGallery) {
         _galleryOriginItem =
-            SPKMediaChromeBottomBarButtonItem(@"more", @"More", nil, nil);
+            SPKMediaChromeBottomBarButtonItem(@"more", SPKL(@"COMMON_MORE_ACCESSIBILITY_LABEL"), nil, nil);
 
         _deleteGalleryItem = SPKMediaChromeBottomBarButtonItem(
-            @"trash", @"Delete from Gallery", self, @selector(deleteFromGallery));
+            @"trash", SPKL(@"GALLERY_GALLERY_DELETE_GALLERY_TEXT"), self, @selector(deleteFromGallery));
         _deleteGalleryItem.tintColor = [SPKUtils SPKColor_InstagramDestructive];
     } else {
         _saveGalleryItem = SPKMediaChromeBottomBarButtonItem(
-            @"sparkle_gallery", @"Save to Gallery", self, @selector(saveToGallery));
+            @"sparkle_gallery", SPKL(@"FEED_COMMENT_ACTIONS_SAVE_GALLERY_TEXT"), self, @selector(saveToGallery));
         _downloadURLItem = SPKMediaChromeBottomBarButtonItem(
-            @"link", @"Copy Download URL", self,
+            @"link", SPKL(@"FEED_COMMENT_ACTIONS_COPY_DOWNLOAD_URL_TEXT"), self,
             @selector(copyDownloadURLForCurrentItem));
     }
 
@@ -902,6 +962,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 
 - (void)rebuildBottomToolbarItems {
     NSMutableArray<UIBarButtonItem *> *primary = [NSMutableArray array];
+    NSMutableArray<UIBarButtonItem *> *editing = [NSMutableArray array];
     NSMutableArray<UIBarButtonItem *> *trailing = [NSMutableArray array];
     [primary addObject:_savePhotosItem];
     [primary addObject:_shareItem];
@@ -912,18 +973,18 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     SPKMediaItemType currentType = [self currentItem].mediaType;
     if (_trimItem && (currentType == SPKMediaItemTypeVideo ||
                       currentType == SPKMediaItemTypeAudio)) {
-        [trailing addObject:_trimItem];
+        [editing addObject:_trimItem];
     }
     // Photos get an Edit (crop / rotate / flip) action in the same trailing
     // capsule the video/audio Trim uses — both Gallery items (Replace / Copy) and
     // expanded Instagram photos (destination menu), mirroring Trim's availability.
     if (_editItem && currentType == SPKMediaItemTypeImage) {
-        [trailing addObject:_editItem];
+        [editing addObject:_editItem];
     }
 
     if (_isFromGallery) {
         // Delete stays in the primary group; "more" breaks out into its own
-        // trailing capsule, sitting after the trash icon.
+        // capsule after Trim / Edit, so the two never share a bubble.
         if (_deleteGalleryItem) {
             [primary addObject:_deleteGalleryItem];
         }
@@ -938,14 +999,20 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
         if (_downloadURLItem) {
             [primary addObject:_downloadURLItem];
         }
-        // "Download all" / bulk actions overflow gets its own trailing capsule.
-        if (_bulkActionsItem && _bulkActionsItemVisible) {
-            [trailing addObject:_bulkActionsItem];
-        }
     }
 
-    self.toolbarItems =
-        SPKMediaChromeBottomToolbarItemsWithTrailingGroup(primary, trailing);
+    self.toolbarItems = SPKMediaChromeBottomToolbarItemsWithGroups(@[ primary, editing, trailing ]);
+    [self updateTrailingTopBarItems];
+}
+
+// Gallery items show Favorite, expanded Instagram media the bulk actions menu.
+- (void)updateTrailingTopBarItems {
+    NSMutableArray<UIBarButtonItem *> *items = [NSMutableArray array];
+    if (_topFavoriteItem && [self currentItem].galleryFile)
+        [items addObject:_topFavoriteItem];
+    if (_bulkActionsItem && _bulkActionsItemVisible)
+        [items addObject:_bulkActionsItem];
+    SPKMediaChromeSetTrailingTopBarItems(self.navigationItem, items);
 }
 
 /// Anchor view for popovers/action sheets presented from the bottom toolbar.
@@ -1127,6 +1194,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     // Keep the fixed between-bars inset applied to whatever page is shown.
     [controller loadViewIfNeeded];
     [self applyMediaContentBarInsetsToController:controller];
+    [self applyChromeBottomLimitToController:controller];
 }
 
 - (void)prepareAdjacentViewControllersAroundIndex:(NSInteger)index {
@@ -1204,9 +1272,27 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 - (void)updatePlayerControlInsetsForVideoController:
             (SPKFullScreenVideoViewController *)videoController
                                            animated:(BOOL)animated {
-    UIEdgeInsets insets =
-        UIEdgeInsetsMake(0.0, 0.0, kVideoPlayerControlBottomInset, 0.0);
-    [videoController setPlayerControlOverlayInsets:insets animated:animated];
+    CGFloat bottomBoundaryInset = 0.0;
+    BOOL usesLegacyToolbar = YES;
+    if (@available(iOS 26.0, *)) {
+        usesLegacyToolbar = NO;
+    }
+    if (usesLegacyToolbar && self.isToolbarVisible && !self.previewOnly &&
+        !SPKFullScreenPreviewShouldInsetMediaBetweenBars()) {
+        UIToolbar *toolbar = self.navigationController.toolbar;
+        if (toolbar && !toolbar.hidden && toolbar.window) {
+            CGRect toolbarFrame = [self.view convertRect:toolbar.bounds
+                                                 fromView:toolbar];
+            bottomBoundaryInset =
+                MAX(0.0, CGRectGetMaxY(self.view.bounds) -
+                             CGRectGetMinY(toolbarFrame));
+        } else if (self.hasChromeBottomLimit) {
+            bottomBoundaryInset = self.chromeBottomLimit;
+        }
+    }
+    [videoController synchronizePlayerControlsToBottomBoundaryInset:
+                         bottomBoundaryInset
+                                                          animated:animated];
 }
 
 - (void)updateCurrentVideoPlayerControlInsetsAnimated:(BOOL)animated {
@@ -1264,7 +1350,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 
     for (UIViewController *prevVC in previousViewControllers) {
         if ([prevVC isKindOfClass:[SPKFullScreenVideoViewController class]]) {
-            [(SPKFullScreenVideoViewController *)prevVC pause];
+            [(SPKFullScreenVideoViewController *)prevVC suspendPlayback];
         }
     }
 }
@@ -1288,6 +1374,116 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     _pageScrollView.scrollEnabled = !isZoomed;
 }
 
+#pragma mark - Picture in Picture Handoff
+
+- (void)mediaContentWillStartPictureInPicture:(UIViewController *)controller {
+    if (self.pictureInPictureHandoffActive)
+        return;
+    UIViewController *presented = self.navigationController ?: self;
+    if (!presented.presentingViewController)
+        return;
+
+    self.pictureInPictureHandoffActive = YES;
+    self.pictureInPictureSelfRetain = self;
+    self.pictureInPicturePresentation = presented;
+
+    // Our zoom transition animates between the media and the view it was opened
+    // from, which is not where this is going: the window takes the media's place.
+    // Plain modal dismissal for this one trip; the delegate goes back on once the
+    // viewer is restored, because it is also what drives the interactive swipe.
+    presented.transitioningDelegate = nil;
+
+    // Deliberately none of the cleanup the other dismissal paths run: the pages
+    // stay built and the host's own playback stays suppressed until the window
+    // closes, either straight into -mediaContentDidStopPictureInPicture: or after
+    // a restore.
+    [presented dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)mediaContent:(UIViewController *)controller
+    restorePictureInPictureWithCompletion:(void (^)(BOOL restored))completion {
+    UIViewController *presented = self.pictureInPicturePresentation ?: (self.navigationController ?: self);
+    if (!self.pictureInPictureHandoffActive || presented.presentingViewController) {
+        // Never stepped aside (or already back): the content is in a window already.
+        completion(presented.view.window != nil);
+        return;
+    }
+
+    UIViewController *presenter = topMostController();
+    if (!presenter) {
+        completion(NO);
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    [presenter presentViewController:presented
+                            animated:YES
+                          completion:^{
+                              // Back on screen, so the zoom transition is meaningful
+                              // again. It also vends the dismissal's interaction
+                              // controller, and without it a swipe down dismisses the
+                              // moment it starts instead of tracking the finger.
+                              presented.transitioningDelegate = weakSelf;
+                              completion(YES);
+                          }];
+}
+
+- (void)mediaContentDidStopPictureInPicture:(UIViewController *)controller {
+    if (!self.pictureInPictureHandoffActive)
+        return;
+    self.pictureInPictureHandoffActive = NO;
+
+    UIViewController *presented = self.pictureInPicturePresentation;
+    self.pictureInPicturePresentation = nil;
+    if (presented.presentingViewController) {
+        // Restored: the viewer is back on screen and owns the player again.
+        [self releasePictureInPictureRetain];
+        return;
+    }
+
+    // The window closed without coming back, so this is where the dismissal that
+    // started the handoff actually finishes.
+    [self cleanupAll];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self restorePreviewPlaybackIfNeeded];
+    });
+    if ([self.delegate respondsToSelector:@selector(fullScreenMediaPlayerDidDismiss)]) {
+        [self.delegate fullScreenMediaPlayerDidDismiss];
+    }
+    [self releasePictureInPictureRetain];
+}
+
+// Dropping the self-reference inline can be the last release, running -dealloc
+// inside this call. Hand it to the next main-queue turn instead.
+- (void)releasePictureInPictureRetain {
+    SPKFullScreenMediaPlayer *retained = self.pictureInPictureSelfRetain;
+    _pictureInPictureSelfRetain = nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        (void)retained;
+    });
+}
+
+- (void)mediaContent:(UIViewController *)controller
+    didChangeLiveTextHighlight:(BOOL)highlighted {
+    // Only the visible page owns the chrome; a page being torn down or preloaded
+    // off screen must not fade the overlay for the photo the user is looking at.
+    if (controller != self.pageViewController.viewControllers.firstObject)
+        return;
+    if (_liveTextHighlightActive == highlighted)
+        return;
+    _liveTextHighlightActive = highlighted;
+    if (!_infoOverlay || _infoOverlay.hidden)
+        return;
+    // Match the chrome toggle so the two never look like separate events.
+    [UIView animateWithDuration:UINavigationControllerHideShowBarDuration
+                          delay:0.0
+                        options:UIViewAnimationOptionCurveEaseInOut |
+                                UIViewAnimationOptionBeginFromCurrentState
+                     animations:^{
+                         self.infoOverlay.alpha = [self infoOverlayVisibleAlpha];
+                     }
+                     completion:nil];
+}
+
 #pragma mark - UI Updates
 
 - (void)updateUI {
@@ -1305,40 +1501,31 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 
 - (void)updateCounter {
     if (_isSingleItemMode) {
-        self.title = nil;
+        SPKMediaChromeSetGlassTitle(self, nil);
         return;
     }
-    self.title =
-        [NSString stringWithFormat:@"%ld of %lu", (long)_currentIndex + 1,
-                                   (unsigned long)[self itemCount]];
+    SPKMediaChromeSetGlassTitle(
+        self, [NSString stringWithFormat:SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_VALUE_VALUE_FORMAT"),
+                                         (long)_currentIndex + 1, (unsigned long)[self itemCount]]);
 }
 
 - (void)updateFavoriteButton {
-    if (!_topFavoriteItem)
-        return;
-
     SPKMediaItem *item = [self currentItem];
-    BOOL isFav = item.galleryFile.isFavorite;
-    UIImage *img = isFav ? SPKMediaChromeTopBarIcon(@"heart_filled")
-                         : SPKMediaChromeTopBarIcon(@"heart");
-
-    if (!item.galleryFile) {
-        SPKMediaChromeSetTrailingTopBarItems(self.navigationItem, @[]);
-        return;
+    if (_topFavoriteItem && item.galleryFile) {
+        BOOL isFav = item.galleryFile.isFavorite;
+        _topFavoriteItem.image = isFav ? SPKMediaChromeTopBarIcon(@"heart_filled")
+                                       : SPKMediaChromeTopBarIcon(@"heart");
+        _topFavoriteItem.tintColor =
+            isFav ? [UIColor systemPinkColor] : [UIColor labelColor];
+        _topFavoriteItem.accessibilityLabel = isFav ? SPKL(@"GALLERY_GALLERY_UNFAVORITE_TEXT") : SPKL(@"GALLERY_GALLERY_FAVORITE_TEXT");
     }
-
-    _topFavoriteItem.image = img;
-    _topFavoriteItem.tintColor =
-        isFav ? [UIColor systemPinkColor] : [UIColor labelColor];
-    _topFavoriteItem.accessibilityLabel = isFav ? @"Unfavorite" : @"Favorite";
-    SPKMediaChromeSetTrailingTopBarItems(self.navigationItem,
-                                         @[ _topFavoriteItem ]);
+    [self updateTrailingTopBarItems];
 }
 
 - (void)showGalleryOpenFailureMessage:(NSString *)title
                      actionIdentifier:(NSString *)actionIdentifier {
     SPKNotify(actionIdentifier, title,
-              @"The original content may no longer exist.", @"error_filled",
+              SPKL(@"COMMON_ORIGINAL_CONTENT_UNAVAILABLE_TOAST"), @"error_filled",
               SPKNotificationToneError);
 }
 
@@ -1405,7 +1592,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
                                                fromViewController:self
                                                    legacyFallback:^{
                                                        [weakSelf dismissGalleryFlowForOriginOpenWithCompletion:^{
-                                                           SPKNotify(kSPKNotificationGalleryOpenOriginal, @"Opened original post",
+                                                           SPKNotify(kSPKNotificationGalleryOpenOriginal, SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_OPENED_ORIGINAL_POST_TEXT"),
                                                                      nil, @"external_link",
                                                                      SPKNotificationToneForIconResource(@"external_link"));
                                                        }];
@@ -1415,7 +1602,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
                                                         }]) {
         // Nothing to announce: the post is on screen.
     } else {
-        [self showGalleryOpenFailureMessage:@"Unable to open original post"
+        [self showGalleryOpenFailureMessage:SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_UNABLE_OPEN_ORIGINAL_POST_TEXT")
                            actionIdentifier:kSPKNotificationGalleryOpenOriginal];
     }
 }
@@ -1433,11 +1620,11 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
                                                   if (success) {
                                                       // Quiet when a link was just made: that toast already said it.
                                                       if (!didLink)
-                                                          SPKNotify(kSPKNotificationGalleryOpenProfile, @"Opened profile", nil,
+                                                          SPKNotify(kSPKNotificationGalleryOpenProfile, SPKL(@"COMMON_OPENED_PROFILE_TOAST"), nil,
                                                                     @"user_circle",
                                                                     SPKNotificationToneForIconResource(@"user_circle"));
                                                   } else {
-                                                      [weakSelf showGalleryOpenFailureMessage:@"Unable to open profile"
+                                                      [weakSelf showGalleryOpenFailureMessage:SPKL(@"COMMON_UNABLE_OPEN_PROFILE_TOAST")
                                                                              actionIdentifier:kSPKNotificationGalleryOpenProfile];
                                                   }
                                               }];
@@ -1450,7 +1637,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 
     if (file.hasOpenableOriginalMedia) {
         [actions addObject:[UIAction
-                               actionWithTitle:@"Open Original Post"
+                               actionWithTitle:SPKL(@"ALERT_ACTION_OPEN_ORIGINAL_POST")
                                          image:SPKGalleryPreviewMenuIcon(
                                                    @"external_link")
                                     identifier:nil
@@ -1463,7 +1650,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     if (file.hasOpenableProfile) {
         [actions
             addObject:[UIAction
-                          actionWithTitle:@"Open Profile"
+                          actionWithTitle:SPKL(@"ALERT_ACTION_OPEN_PROFILE")
                                     image:SPKGalleryPreviewMenuIcon(@"user_circle")
                                identifier:nil
                                   handler:^(__unused UIAction *action) {
@@ -1472,7 +1659,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     }
 
     if (actions.count == 0) {
-        UIAction *empty = [UIAction actionWithTitle:@"No origin actions available"
+        UIAction *empty = [UIAction actionWithTitle:SPKL(@"ALERT_ACTION_NO_ORIGIN_ACTIONS_AVAILABLE")
                                               image:nil
                                          identifier:nil
                                             handler:^(__unused UIAction *action){
@@ -1505,13 +1692,13 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     }
     NSURL *url = item.resolvedFileURL ?: item.fileURL;
     if (!url || ![[NSFileManager defaultManager] fileExistsAtPath:url.path]) {
-        SPKNotify(@"spk.trim.preview", @"Cannot trim",
-                  @"The media file is unavailable.", @"error_filled",
+        SPKNotify(@"spk.trim.preview", SPKL(@"MEDIA_TRIM_CANNOT_TRIM_TOAST"),
+                  SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_MEDIA_FILE_UNAVAILABLE_TEXT"), @"error_filled",
                   SPKNotificationToneError);
         return;
     }
     // Pause the preview's playback so its audio stops while the editor is open.
-    [[self currentVideoViewController] pause];
+    [[self currentVideoViewController] suspendPlayback];
 
     SPKTrimConfiguration *config = isAudio
                                        ? [SPKTrimConfiguration configurationWithAudioURL:url]
@@ -1528,15 +1715,15 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
         // Photos can't hold an audio file, so for audio offer "Save Audio to Files"
         // (broadly available for audio) in its place.
         if (isAudio) {
-            [options addObject:[SPKTrimDoneOption optionWithTitle:@"Save Audio to Files" identifier:@"files" iconName:@"audio_download"]];
-            [options addObject:[SPKTrimDoneOption optionWithTitle:@"Share Audio" identifier:@"share" iconName:@"share"]];
-            [options addObject:[SPKTrimDoneOption optionWithTitle:@"Copy Audio" identifier:@"clipboard" iconName:@"copy"]];
-            [options addObject:[SPKTrimDoneOption optionWithTitle:@"Save Audio to Gallery" identifier:@"gallery" iconName:@"sparkle_gallery"]];
+            [options addObject:[SPKTrimDoneOption optionWithTitle:SPKL(@"ALERT_ACTION_SAVE_AUDIO_FILES") identifier:@"files" iconName:@"audio_download"]];
+            [options addObject:[SPKTrimDoneOption optionWithTitle:SPKL(@"ALERT_ACTION_SHARE_AUDIO") identifier:@"share" iconName:@"share"]];
+            [options addObject:[SPKTrimDoneOption optionWithTitle:SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_COPY_AUDIO_TEXT") identifier:@"clipboard" iconName:@"copy"]];
+            [options addObject:[SPKTrimDoneOption optionWithTitle:SPKL(@"ALERT_ACTION_SAVE_AUDIO_GALLERY") identifier:@"gallery" iconName:@"sparkle_gallery"]];
         } else {
-            [options addObject:[SPKTrimDoneOption optionWithTitle:@"Save to Photos" identifier:@"photos" iconName:@"download"]];
-            [options addObject:[SPKTrimDoneOption optionWithTitle:@"Share" identifier:@"share" iconName:@"share"]];
-            [options addObject:[SPKTrimDoneOption optionWithTitle:@"Copy" identifier:@"clipboard" iconName:@"copy"]];
-            [options addObject:[SPKTrimDoneOption optionWithTitle:@"Save to Gallery" identifier:@"gallery" iconName:@"sparkle_gallery"]];
+            [options addObject:[SPKTrimDoneOption optionWithTitle:SPKL(@"FEED_COMMENT_ACTIONS_SAVE_PHOTOS_TEXT") identifier:@"photos" iconName:@"download"]];
+            [options addObject:[SPKTrimDoneOption optionWithTitle:SPKL(@"ALERT_ACTION_SHARE") identifier:@"share" iconName:@"share"]];
+            [options addObject:[SPKTrimDoneOption optionWithTitle:SPKL(@"FEED_COMMENT_ACTIONS_COPY_TEXT") identifier:@"clipboard" iconName:@"copy"]];
+            [options addObject:[SPKTrimDoneOption optionWithTitle:SPKL(@"FEED_COMMENT_ACTIONS_SAVE_GALLERY_TEXT") identifier:@"gallery" iconName:@"sparkle_gallery"]];
         }
         config.doneOptions = options;
     }
@@ -1600,8 +1787,8 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
                                                     presenter:self];
             return;
         }
-        SPKNotify(@"spk.photoedit.load", @"Cannot Edit",
-                  @"The image file is unavailable.", @"error_filled",
+        SPKNotify(@"spk.photoedit.load", SPKL(@"GALLERY_GALLERY_CANNOT_EDIT_TEXT"),
+                  SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_IMAGE_FILE_UNAVAILABLE_TEXT"), @"error_filled",
                   SPKNotificationToneError);
         return;
     }
@@ -1636,16 +1823,16 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     // trim flow — no silent Gallery dump.
     SPKPhotoEditorConfiguration *config = [SPKPhotoEditorConfiguration freeformConfiguration];
     config.doneOptions = @[
-        [SPKPhotoEditorDoneOption optionWithTitle:@"Save to Photos"
+        [SPKPhotoEditorDoneOption optionWithTitle:SPKL(@"FEED_COMMENT_ACTIONS_SAVE_PHOTOS_TEXT")
                                        identifier:@"photos"
                                          iconName:@"download"],
-        [SPKPhotoEditorDoneOption optionWithTitle:@"Share"
+        [SPKPhotoEditorDoneOption optionWithTitle:SPKL(@"ALERT_ACTION_SHARE")
                                        identifier:@"share"
                                          iconName:@"share"],
-        [SPKPhotoEditorDoneOption optionWithTitle:@"Copy"
+        [SPKPhotoEditorDoneOption optionWithTitle:SPKL(@"FEED_COMMENT_ACTIONS_COPY_TEXT")
                                        identifier:@"clipboard"
                                          iconName:@"copy"],
-        [SPKPhotoEditorDoneOption optionWithTitle:@"Save to Gallery"
+        [SPKPhotoEditorDoneOption optionWithTitle:SPKL(@"FEED_COMMENT_ACTIONS_SAVE_GALLERY_TEXT")
                                        identifier:@"gallery"
                                          iconName:@"sparkle_gallery"],
     ];
@@ -1744,10 +1931,9 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     _galleryOriginItem.target = nil;
     _galleryOriginItem.action = nil;
 
+    // With neither a profile nor a post to open there is nothing to offer.
     if (actionCount <= 0) {
-        _galleryOriginItem.image = SPKMediaChromeBottomBarIcon(@"more");
-        _galleryOriginItem.accessibilityLabel = @"More";
-        _galleryOriginItem.enabled = NO;
+        _galleryOriginItemVisible = NO;
         _galleryOriginItem.menu = nil;
         [self rebuildBottomToolbarItems];
         return;
@@ -1757,7 +1943,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 
     if (actionCount == 1) {
         NSString *resourceName = hasProfile ? @"user_circle" : @"external_link";
-        NSString *label = hasProfile ? @"Open Profile" : @"Open Original Post";
+        NSString *label = hasProfile ? SPKL(@"ALERT_ACTION_OPEN_PROFILE") : SPKL(@"ALERT_ACTION_OPEN_ORIGINAL_POST");
         _galleryOriginItem.image = SPKMediaChromeBottomBarIcon(resourceName);
         _galleryOriginItem.accessibilityLabel = label;
         _galleryOriginItem.menu = nil;
@@ -1768,7 +1954,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     }
 
     _galleryOriginItem.image = SPKMediaChromeBottomBarIcon(@"more");
-    _galleryOriginItem.accessibilityLabel = @"More";
+    _galleryOriginItem.accessibilityLabel = SPKL(@"MESSAGES_DELETED_MESSAGES_MORE_TEXT");
     _galleryOriginItem.menu = [self galleryOriginMenuForCurrentItem];
     [self rebuildBottomToolbarItems];
 }
@@ -1809,7 +1995,8 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
         animations:^{
             [self setNeedsStatusBarAppearanceUpdate];
             [navigationController setNeedsStatusBarAppearanceUpdate];
-            self.infoOverlay.alpha = visible ? 1.0 : 0.0;
+            self.infoOverlay.alpha =
+                (visible && !self.liveTextHighlightActive) ? 1.0 : 0.0;
             for (UIViewController *controller in self.pageViewController
                      .viewControllers) {
                 [self applyMediaContentBarInsetsToController:controller];
@@ -2057,9 +2244,8 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
         req.preferredFileExtension = extension;
         req.metadata = metadata;
         req.index = index;
-        req.linkString = mediaItem.fileURL.absoluteString.length
-                             ? mediaItem.fileURL.absoluteString
-                             : resolvedURL.absoluteString;
+        req.linkString = [self downloadLinkStringForItem:mediaItem]
+                             ?: resolvedURL.absoluteString;
         req.expectedFilenameStem = [[SPKDownloadHelpers
             preferredFilenameForURL:resolvedURL
                           mediaKind:kind
@@ -2071,15 +2257,32 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     return items;
 }
 
+// Remote photos and videos with a source media pick their link through the
+// download-quality preferences, like a download does. Local files, audio and bare
+// URLs copy as they are.
+- (nullable NSString *)downloadLinkStringForItem:(SPKMediaItem *)item {
+    NSURL *fileURL = item.fileURL;
+    BOOL isImage = item.mediaType == SPKMediaItemTypeImage;
+    BOOL isVideo = item.mediaType == SPKMediaItemTypeVideo;
+    if (item.sourceMediaObject && fileURL && !fileURL.isFileURL && (isImage || isVideo)) {
+        NSURL *linkURL = [SPKMediaQualityManager downloadLinkURLForMediaObject:item.sourceMediaObject
+                                                                      photoURL:isImage ? fileURL : nil
+                                                                      videoURL:isVideo ? fileURL : nil
+                                                          photoQualityOverride:nil];
+        if (linkURL.absoluteString.length > 0)
+            return linkURL.absoluteString;
+    }
+    NSString *linkString = fileURL.absoluteString;
+    if (linkString.length == 0) {
+        linkString = [[SPKMediaCacheManager sharedManager] bestAvailableFileURLForItem:item].absoluteString;
+    }
+    return linkString.length > 0 ? linkString : nil;
+}
+
 - (NSArray<NSString *> *)bulkDownloadLinksForPreview {
     NSMutableOrderedSet<NSString *> *links = [NSMutableOrderedSet orderedSet];
     for (SPKMediaItem *item in self.items) {
-        NSString *linkString = item.fileURL.absoluteString;
-        if (linkString.length == 0) {
-            NSURL *resolvedURL = [[SPKMediaCacheManager sharedManager]
-                bestAvailableFileURLForItem:item];
-            linkString = resolvedURL.absoluteString;
-        }
+        NSString *linkString = [self downloadLinkStringForItem:item];
         if (linkString.length > 0) {
             [links addObject:linkString];
         }
@@ -2088,6 +2291,14 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 }
 
 - (void)copyAllDownloadLinks {
+    __weak typeof(self) weakSelf = self;
+    if ([self beginFetching4KCandidatesForItem:[self currentItem]
+                                    identifier:kSPKActionCopyDownloadLink
+                                         retry:^{
+                                             [weakSelf copyAllDownloadLinks];
+                                         }]) {
+        return;
+    }
     [self copyDownloadLinks:[self bulkDownloadLinksForPreview]];
 }
 
@@ -2102,30 +2313,50 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 }
 
 - (void)copyDownloadLinks:(NSArray<NSString *> *)links {
+    [[SPKNotificationCenter shared] dismissTransientProgressPill];
     if (links.count == 0) {
-        SPKNotify(kSPKActionCopyDownloadLink, @"No links available", nil,
+        SPKNotify(kSPKActionCopyDownloadLink, SPKL(@"ACTION_BUTTON_ACTION_BUTTON_CORE_NO_LINKS_AVAILABLE_TEXT"), nil,
                   @"error_filled", SPKNotificationToneError);
         return;
     }
 
     [UIPasteboard generalPasteboard].string =
         [links componentsJoinedByString:@"\n"];
+    BOOL plural = links.count > 1;
     SPKNotify(
         kSPKActionCopyDownloadLink,
-        SPKCopiedDownloadURLTitleForPlaybackSource(self.playbackSource, YES),
-        [NSString stringWithFormat:@"%lu item%@", (unsigned long)links.count,
-                                   links.count == 1 ? @"" : @"s"],
+        SPKCopiedDownloadURLTitleForPlaybackSource(self.playbackSource, plural),
+        plural ? SPKLP(@"COMMON_ITEM_COUNT", (NSInteger)links.count) : nil,
         @"circle_check_filled", SPKNotificationToneSuccess);
 }
 
 - (void)copyDownloadURLForCurrentItem {
     SPKMediaItem *item = [self currentItem];
-    NSString *linkString = item.fileURL.absoluteString;
-    if (linkString.length == 0) {
-        NSURL *resolvedURL = [[SPKMediaCacheManager sharedManager]
-            bestAvailableFileURLForItem:item];
-        linkString = resolvedURL.absoluteString;
+    __weak typeof(self) weakSelf = self;
+    if ([self beginFetching4KCandidatesForItem:item
+                                    identifier:kSPKActionCopyDownloadLink
+                                         retry:^{
+                                             [weakSelf copyDownloadURLForCurrentItem];
+                                         }]) {
+        return;
     }
+    NSURL *fileURL = item.fileURL;
+    BOOL isImage = item.mediaType == SPKMediaItemTypeImage;
+    BOOL isVideo = item.mediaType == SPKMediaItemTypeVideo;
+    if (item.sourceMediaObject && fileURL && !fileURL.isFileURL && (isImage || isVideo)) {
+        [[SPKNotificationCenter shared] dismissTransientProgressPill];
+        [SPKMediaQualityManager resolveDownloadLinkForMediaObject:item.sourceMediaObject
+                                                         photoURL:isImage ? fileURL : nil
+                                                         videoURL:isVideo ? fileURL : nil
+                                                        presenter:self
+                                                       sourceView:[self bottomBarAnchorView]
+                                                       completion:^(NSURL *url) {
+                                                           NSString *linkString = url.absoluteString;
+                                                           [weakSelf copyDownloadLinks:linkString.length > 0 ? @[ linkString ] : @[]];
+                                                       }];
+        return;
+    }
+    NSString *linkString = [self downloadLinkStringForItem:item];
     [self copyDownloadLinks:linkString.length > 0 ? @[ linkString ] : @[]];
 }
 
@@ -2175,7 +2406,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 
     // Mirror the action-button bulk menu: let the user hand-pick a subset.
     UIAction *selectMediaAction = [UIAction
-        actionWithTitle:[NSString stringWithFormat:@"Select Media • %lu",
+        actionWithTitle:[NSString stringWithFormat:SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_SELECT_MEDIA_VALUE_FORMAT"),
                                                    (unsigned long)bulkItems.count]
                   image:[SPKAssetUtils menuIconNamed:@"carousel"]
              identifier:nil
@@ -2323,10 +2554,10 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 
 - (void)showSaveResult:(BOOL)success error:(NSError *)error {
     if (success) {
-        SPKNotify(kSPKNotificationMediaPreviewSavePhotos, @"Saved to Photos", nil,
+        SPKNotify(kSPKNotificationMediaPreviewSavePhotos, SPKL(@"DOWNLOADS_DOWNLOAD_PRESENTER_SAVED_PHOTOS_TEXT"), nil,
                   @"circle_check_filled", SPKNotificationToneSuccess);
     } else {
-        SPKNotify(kSPKNotificationMediaPreviewSavePhotos, @"Failed to save",
+        SPKNotify(kSPKNotificationMediaPreviewSavePhotos, SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_FAILED_SAVE_TEXT"),
                   error.localizedDescription, @"error_filled",
                   SPKNotificationToneError);
     }
@@ -2366,7 +2597,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
         return NO;
 
     if (identifier.length > 0 && SPKNotificationIsEnabled(identifier)) {
-        [[SPKNotificationCenter shared] beginTransientProgressWithTitle:@"Fetching 4K candidates..."
+        [[SPKNotificationCenter shared] beginTransientProgressWithTitle:SPKL(@"ACTION_BUTTON_ACTION_BUTTON_CORE_FETCHING_4K_CANDIDATES_TEXT")
                                                                onCancel:nil];
     }
     [SPKInstagramAPI fetchWebMediaInfoForPK:mediaPK
@@ -2465,7 +2696,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     SPKMediaItem *item = [self currentItem];
 
     if (!targetURL && !item.image) {
-        SPKNotify(kSPKNotificationMediaPreviewSaveGallery, @"No media to save", nil,
+        SPKNotify(kSPKNotificationMediaPreviewSaveGallery, SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_NO_MEDIA_SAVE_TEXT"), nil,
                   @"media", SPKNotificationToneError);
         return;
     }
@@ -2577,7 +2808,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
                 activityItem = item.image;
             }
         }
-        SPKNotify(kSPKNotificationMediaPreviewShare, @"Opened share sheet", nil,
+        SPKNotify(kSPKNotificationMediaPreviewShare, SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_OPENED_SHARE_SHEET_TEXT"), nil,
                   @"share", SPKNotificationToneInfo);
         UIActivityViewController *acVC = [[UIActivityViewController alloc]
             initWithActivityItems:@[ activityItem ]
@@ -2621,7 +2852,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
         UIImage *image = item.image ?: [UIImage imageWithData:imageData];
         if (image) {
             [[UIPasteboard generalPasteboard] setImage:image];
-            SPKNotify(kSPKNotificationMediaPreviewCopy, @"Copied photo to clipboard",
+            SPKNotify(kSPKNotificationMediaPreviewCopy, SPKL(@"ACTION_BUTTON_ACTION_BUTTON_CORE_COPIED_PHOTO_CLIPBOARD_TEXT"),
                       nil, @"circle_check_filled", SPKNotificationToneSuccess);
         }
     } else {
@@ -2629,7 +2860,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
         if (data) {
             [[UIPasteboard generalPasteboard] setData:data
                                     forPasteboardType:@"public.mpeg-4"];
-            SPKNotify(kSPKNotificationMediaPreviewCopy, @"Copied video to clipboard",
+            SPKNotify(kSPKNotificationMediaPreviewCopy, SPKL(@"ACTION_BUTTON_ACTION_BUTTON_CORE_COPIED_VIDEO_CLIPBOARD_TEXT"),
                       nil, @"circle_check_filled", SPKNotificationToneSuccess);
         }
     }
@@ -2643,15 +2874,15 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     __weak typeof(self) weakSelf = self;
     [SPKIGAlertPresenter
         presentAlertFromViewController:self
-                                 title:@"Delete from Gallery"
-                               message:@"This will permanently remove this file."
+                                 title:SPKL(@"GALLERY_GALLERY_DELETE_GALLERY_TEXT")
+                               message:SPKL(@"MEDIA_PREVIEW_FULL_SCREEN_MEDIA_PLAYER_PERMANENTLY_REMOVE_FILE_TEXT")
                                actions:@[
                                    [SPKIGAlertAction
-                                       actionWithTitle:@"Cancel"
+                                       actionWithTitle:SPKL(@"ALERT_ACTION_CANCEL")
                                                  style:SPKIGAlertActionStyleCancel
                                                handler:nil],
                                    [SPKIGAlertAction
-                                       actionWithTitle:@"Delete"
+                                       actionWithTitle:SPKL(@"ALERT_ACTION_DELETE")
                                                  style:
                                                      SPKIGAlertActionStyleDestructive
                                                handler:^{
@@ -2670,7 +2901,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     NSError *err;
     [item.galleryFile removeWithError:&err];
     if (err) {
-        SPKNotify(kSPKNotificationMediaPreviewDeleteGallery, @"Failed to delete",
+        SPKNotify(kSPKNotificationMediaPreviewDeleteGallery, SPKL(@"COMMON_DELETE_FAILED_TOAST"),
                   err.localizedDescription, @"error_filled",
                   SPKNotificationToneError);
         return;
@@ -2693,7 +2924,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
 
     if ([self itemCount] == 0) {
         SPKNotify(kSPKNotificationMediaPreviewDeleteGallery,
-                  @"Deleted from Gallery", nil, @"circle_check_filled",
+                  SPKL(@"GALLERY_DELETED_FROM_GALLERY_TOAST"), nil, @"circle_check_filled",
                   SPKNotificationToneSuccess);
         [self closeTapped];
         return;
@@ -2721,7 +2952,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     [self prepareViewControllerForDisplay:newVC];
     [self prepareAdjacentViewControllersAroundIndex:_currentIndex];
     [self updateUI];
-    SPKNotify(kSPKNotificationMediaPreviewDeleteGallery, @"Deleted from Gallery",
+    SPKNotify(kSPKNotificationMediaPreviewDeleteGallery, SPKL(@"GALLERY_DELETED_FROM_GALLERY_TOAST"),
               nil, @"circle_check_filled", SPKNotificationToneSuccess);
 }
 
@@ -2859,7 +3090,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
                     self.navigationController.navigationBar.alpha = alpha;
                     self.navigationController.toolbar.alpha = alpha;
                     self.infoOverlay.transform = CGAffineTransformIdentity;
-                    self.infoOverlay.alpha = alpha;
+                    self.infoOverlay.alpha = [self infoOverlayVisibleAlpha];
                 }
                 completion:^(BOOL finished) {
                     UIViewController *currentVC =
@@ -2908,7 +3139,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
         self.navigationController.navigationBar.alpha = alpha;
         self.navigationController.toolbar.alpha = alpha;
         self.infoOverlay.transform = CGAffineTransformIdentity;
-        self.infoOverlay.alpha = alpha;
+        self.infoOverlay.alpha = [self infoOverlayVisibleAlpha];
     };
     if (animated) {
         [UIView animateWithDuration:0.25 animations:animations];
@@ -2958,7 +3189,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     // Keep the info overlay attached to the media: translate with it and fade
     // together with the chrome.
     self.infoOverlay.transform = CGAffineTransformMakeTranslation(0.0, verticalDelta);
-    self.infoOverlay.alpha = MAX(0.0, fade);
+    self.infoOverlay.alpha = MAX(0.0, fade) * [self infoOverlayVisibleAlpha];
 }
 
 - (void)removeTransitionToViewForCancelledInteractiveDismissalIfNeeded {
@@ -3000,7 +3231,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
     self.pageViewController.view.transform = CGAffineTransformIdentity;
     self.pageViewController.view.center = SPKCenterForBounds(self.view.bounds);
     self.infoOverlay.transform = CGAffineTransformIdentity;
-    self.infoOverlay.alpha = self.isToolbarVisible ? 1.0 : 0.0;
+    self.infoOverlay.alpha = [self infoOverlayVisibleAlpha];
 }
 
 - (id<UIViewControllerAnimatedTransitioning>)
@@ -3098,7 +3329,7 @@ static CGPoint SPKCenterForBounds(CGRect bounds) {
             if (!completed) {
                 self.pageViewController.view.alpha = 1.0;
                 self.presentationBackdropView.alpha = 1.0;
-                self.infoOverlay.alpha = self.isToolbarVisible ? 1.0 : 0.0;
+                self.infoOverlay.alpha = [self infoOverlayVisibleAlpha];
                 [toView removeFromSuperview];
             }
             [transitionContext completeTransition:completed];

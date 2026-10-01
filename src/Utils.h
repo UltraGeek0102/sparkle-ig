@@ -15,6 +15,7 @@ FOUNDATION_EXPORT void SPKLogMessage(NSString *category,
 
 /// Master toggle for per-account preferences (global, default off).
 FOUNDATION_EXPORT NSString *const kSPKPrefPerAccountSettings;
+FOUNDATION_EXPORT NSNotificationName const SPKHideExploreGridPreferenceDidChangeNotification;
 
 /// Maps a preference key to the key actually stored/read. When per-account mode
 /// is on and the key isn't forced-global, returns a `u_<accountPK>_<key>`
@@ -99,24 +100,31 @@ FOUNDATION_EXPORT Class _Nullable SPKResolveIGClass(NSString *qualified, NSStrin
 + (BOOL)spk_isLiquidGlassEffectivelyEnabled;
 
 + (void)cleanCache;
-+ (unsigned long long)cleanCacheReturningFreedBytes;
 + (unsigned long long)cacheSizeBytes;
-+ (NSString *)formattedCacheSize;
+/// Last measured cache size, for display on the main thread. Starts a background
+/// measurement when none exists or the last one is stale, and posts
+/// SPKSettingAccessoryTextDidChangeNotification when the text changes. Nil until
+/// the first measurement lands.
++ (nullable NSString *)cachedFormattedCacheSize;
+/// Clears the cache on a background queue and calls `completion` on the main
+/// thread. Returns NO without doing anything while a clear is already running.
++ (BOOL)cleanCacheInBackgroundWithCompletion:(nullable void (^)(unsigned long long freedBytes))completion;
 
-/// Time-only date-format component ("HH:mm" or "h:mm a") matching the device's
-/// 12/24-hour clock setting. Use it to compose "<date> at <time>" strings so
-/// they follow the user's preference automatically (no in-app setting).
-+ (NSString *)spk_localizedTimeComponent;
+/// Locale used for Sparkle-owned display formatting. Explicit overrides use the
+/// selected Sparkle language; System Default preserves Instagram/system region.
++ (NSLocale *)spk_activeFormattingLocale;
 
-/// Month/day date-format component ordered for the current locale (e.g. "MMM d"
-/// in en_US, "d MMM" in most others), optionally including the year. Pair with
-/// spk_localizedTimeComponent so dates follow the user's regional format.
-+ (NSString *)spk_localizedDateComponentIncludingYear:(BOOL)includeYear;
+/// Locale-aware absolute display strings. Combined date/time formatting uses a
+/// single ICU skeleton so each language supplies its own order, punctuation and
+/// joiner instead of source code inserting an English word such as "at".
++ (nullable NSString *)spk_formattedTime:(nullable NSDate *)date;
++ (nullable NSString *)spk_formattedDate:(nullable NSDate *)date includingYear:(BOOL)includeYear;
++ (nullable NSString *)spk_formattedDateTime:(nullable NSDate *)date includingYear:(BOOL)includeYear;
 
 /// Recursively extracts the posted date (taken_at, created_at, upload_time, etc.) from an Instagram media object.
 + (nullable NSDate *)postedDateFromMediaObject:(nullable id)media;
 
-/// Formats a date into a localized date-and-time header string (e.g. "Jul 18, 2026 at 5:30 PM").
+/// Backward-compatible full date/time header using the shared formatter.
 + (nullable NSString *)spk_formattedDateHeader:(nullable NSDate *)date;
 
 
@@ -197,6 +205,20 @@ FOUNDATION_EXPORT Class _Nullable SPKResolveIGClass(NSString *qualified, NSStrin
 
 + (NSURL *)getVideoUrl:(IGVideo *)video;
 + (NSURL *)getVideoUrlForMedia:(IGMedia *)media;
+
+// Scroll Views
+/// Lets `scrollView` scroll only while its content is taller than its viewport,
+/// so a sheet whose contents already fit stays put instead of rubber banding.
+/// Call from `viewDidLayoutSubviews` (and after a reload that changes height).
++ (void)updateScrollingForFittedContent:(nullable UIScrollView *)scrollView;
+
+/// The sheet height that would show all of `scrollView`'s content at once, its
+/// chrome included, or 0 while the scroll view has not been laid out yet.
+///
+/// Measured rather than estimated: the adjusted inset already carries the
+/// navigation bar and the bottom safe area, so a detent resolver fed this value
+/// lands on the exact height instead of a few points short.
++ (CGFloat)sheetHeightFittingContentOfScrollView:(nullable UIScrollView *)scrollView;
 
 // View Controller Helpers
 + (UIViewController *)viewControllerForView:(UIView *)view;

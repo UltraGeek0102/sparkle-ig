@@ -1,3 +1,4 @@
+#import "SPKStrings.h"
 #import "SPKWhatsNewViewController.h"
 #import "../Tweak.h"
 
@@ -7,50 +8,59 @@
 // (see whats-new.sh). Feature rows carry a per-surface IG catalog glyph; fix rows
 // share the `subtract` bullet so they read as one clean list. Icon names are
 // SPKAssetUtils override keys — never SF Symbols. Keep in sync with README/FEATURES.
+//
+// Every content row is replaced wholesale each release. The keys name the change
+// rather than its English wording, and the previous release's keys are deleted from
+// every catalog, so a stale translation can never be reused for a different row.
 - (NSArray<SPKPagedSheetPage *> *)buildPages {
     return @[
-        [SPKPagedSheetPage pageWithTitle:@"New Features"
-                                    body:[NSString stringWithFormat:@"What's new in %@", SPKVersionString]
+        [SPKPagedSheetPage pageWithTitle:SPKL(@"SETTINGS_WHATS_NEW_NEW_FEATURES_TEXT")
+                                    body:[NSString stringWithFormat:SPKL(@"SETTINGS_WHATS_NEW_WHAT_S_NEW_VALUE_FORMAT"), SPKVersionString]
                                     rows:@[
-                                        @{ @"icon": @"sparkle_gallery", @"text": @"Import media into the Gallery from Files or a Regram vault" },
-                                        @{ @"icon": @"folder", @"text": @"Browse every Gallery file at once, without entering folders" },
-                                        @{ @"icon": @"crop", @"text": @"Crop, rotate and flip a video, with finer trimming" },
-                                        @{ @"icon": @"instants", @"text": @"Upload any media as an instant" },
-                                        @{ @"icon": @"instants_burst", @"text": @"Browse the instants you saved, grouped by person" },
-                                        @{ @"icon": @"download", @"text": @"Auto-save stories, view-once messages and instants as you view them" },
-                                        @{ @"icon": @"external_link", @"text": @"Profiles, posts and reels open as real Instagram pages" },
+                                        @{ @"icon": @"messages_off", @"text": SPKL(@"SETTINGS_WHATS_NEW_HIDE_CHATS_TEXT") },
+                                        @{ @"icon": @"map_pin", @"text": SPKL(@"SETTINGS_WHATS_NEW_FRIENDS_MAP_LOCATION_TEXT") },
+                                        @{ @"icon": @"instants", @"text": SPKL(@"SETTINGS_WHATS_NEW_INSTANTS_MANUAL_SEEN_TEXT") },
+                                        @{ @"icon": @"playback", @"symbol": @"speedometer", @"text": SPKL(@"SETTINGS_WHATS_NEW_PLAYBACK_CONTROLS_TEXT") },
+                                        @{ @"icon": @"loop", @"text": SPKL(@"SETTINGS_WHATS_NEW_STOP_LOOPING_REELS_TEXT") },
+                                        @{ @"icon": @"compass", @"text": SPKL(@"SETTINGS_WHATS_NEW_OPEN_LINKS_IN_SAFARI_TEXT") },
+                                        @{ @"icon": @"link", @"text": SPKL(@"SETTINGS_WHATS_NEW_CAPTION_LINKS_TEXT") },
+                                        @{ @"icon": @"download", @"text": SPKL(@"SETTINGS_WHATS_NEW_BACKGROUND_DOWNLOADS_TEXT") },
                                     ]],
-        [SPKPagedSheetPage pageWithTitle:@"More To Explore"
+        [SPKPagedSheetPage pageWithTitle:SPKL(@"SETTINGS_WHATS_NEW_MORE_EXPLORE_TEXT")
                                     body:@""
                                     rows:@[
-                                        @{ @"icon": @"hd_check_filled", @"text": @"Refined photo quality tiers with 4K fetching" },
-                                        @{ @"icon": @"folder", @"text": @"Save downloads into a custom Photos album" },
-                                        @{ @"icon": @"pinch", @"text": @"Pinch to zoom into videos in the full-screen preview" },
-                                        @{ @"icon": @"messages", @"text": @"Refined messages-only mode" },
-                                        @{ @"icon": @"story_preview", @"text": @"See message previews by long pressing a chat" },
-                                        @{ @"icon": @"sticker", @"text": @"Upload videos as story stickers from Photos or Sparkle Gallery" },
-                                        @{ @"icon": @"calendar", @"text": @"See a post's date in the action button menu" },
-                                        @{ @"icon": @"profile_analyzer", @"text": @"Swipe to delete a single change in Profile Analyzer" },
-                                        @{ @"icon": @"filter", @"text": @"Sort, filter and search the Gallery picker across folders" },
-                                        @{ @"text": @"...and plenty more!" },
+                                        @{ @"icon": @"translate", @"text": SPKL(@"SETTINGS_WHATS_NEW_LANGUAGE_DOWNLOADS_TEXT") },
+                                        @{ @"icon": @"save", @"text": SPKL(@"SETTINGS_WHATS_NEW_PROFILE_SAVED_TAB_TEXT") },
+                                        @{ @"icon": @"eye", @"text": SPKL(@"SETTINGS_WHATS_NEW_STORY_SEEN_TOGGLE_TEXT") },
+                                        @{ @"icon": @"volume_none", @"text": SPKL(@"SETTINGS_WHATS_NEW_HIDE_AUDIO_UNAVAILABLE_TEXT") },
+                                        @{ @"icon": @"repost", @"text": SPKL(@"SETTINGS_WHATS_NEW_REPOST_DATE_TEXT") },
+                                        @{ @"icon": @"pip", @"symbol": @"pip", @"text": SPKL(@"SETTINGS_WHATS_NEW_PICTURE_IN_PICTURE_TEXT") },
+                                        @{ @"icon": @"grid_square", @"text": SPKL(@"SETTINGS_WHATS_NEW_SQUARE_GRID_TEXT") },
+                                        @{ @"icon": @"sparkle_gallery", @"text": SPKL(@"SETTINGS_WHATS_NEW_GALLERY_DRAG_SELECT_TEXT") },
+                                        @{ @"text": SPKL(@"SETTINGS_WHATS_NEW_PLENTY_MORE_TEXT") },
                                     ]],
-        [SPKPagedSheetPage pageWithTitle:@"Fixes & Improvements"
+        [SPKPagedSheetPage pageWithTitle:SPKL(@"SETTINGS_WHATS_NEW_FIXES_IMPROVEMENTS_TEXT")
                                     body:@""
                                     rows:@[
-                                        @{ @"icon": @"subtract", @"text": @"Fixed a long-standing freeze that made the app crawl after a few screens" },
-                                        @{ @"icon": @"subtract", @"text": @"Notifications are now instant and don't duplicate" },
-                                        @{ @"icon": @"subtract", @"text": @"Much faster Gallery: instant opening, smoother picker, far less memory" },
-                                        @{ @"icon": @"subtract", @"text": @"Story preview and inbox refresh work again on the latest Instagram" },
-                                        @{ @"icon": @"subtract", @"text": @"Instants now download/auto-save in full resolution" },
-                                        @{ @"icon": @"subtract", @"text": @"Poll vote counts now respect hide UI on capture" },
-                                        @{ @"icon": @"subtract", @"text": @"Safe Mode now explains itself, and offers to turn itself off" },
-                                        @{ @"icon": @"subtract", @"text": @"Other bug fixes & UI improvements" },
+                                        @{ @"icon": @"subtract", @"text": SPKL(@"SETTINGS_WHATS_NEW_FIX_INSTAGRAM_448_COMPATIBILITY_TEXT") },
+                                        @{ @"icon": @"subtract", @"text": SPKL(@"SETTINGS_WHATS_NEW_FIX_COMMENTS_SWIPE_TEXT") },
+                                        @{ @"icon": @"subtract", @"text": SPKL(@"SETTINGS_WHATS_NEW_FIX_DELETED_LOG_CRASH_TEXT") },
+                                        @{ @"icon": @"subtract", @"text": SPKL(@"SETTINGS_WHATS_NEW_FIX_INSTANTS_PERFORMANCE_TEXT") },
+                                        @{ @"icon": @"subtract", @"text": SPKL(@"SETTINGS_WHATS_NEW_FIX_SEND_BUTTON_TAPS_TEXT") },
+                                        @{ @"icon": @"subtract", @"text": SPKL(@"SETTINGS_WHATS_NEW_FIX_STORY_PEEK_TEXT") },
+                                        @{ @"icon": @"subtract", @"text": SPKL(@"SETTINGS_WHATS_NEW_FIX_STORY_AUDIO_CHOICE_TEXT") },
+                                        @{ @"icon": @"subtract", @"text": SPKL(@"SETTINGS_WHATS_NEW_FIX_REELS_START_MUTED_TEXT") },
+                                        @{ @"icon": @"subtract", @"text": SPKL(@"SETTINGS_WHATS_NEW_FIX_EXPLORE_LINK_PAGE_TEXT") },
+                                        @{ @"icon": @"subtract", @"text": SPKL(@"SETTINGS_WHATS_NEW_FIX_DOWNLOAD_HISTORY_EDITS_TEXT") },
+                                        @{ @"icon": @"subtract", @"text": SPKL(@"SETTINGS_WHATS_NEW_FIX_ENCODING_SETTINGS_TEXT") },
+                                        @{ @"icon": @"subtract", @"text": SPKL(@"SETTINGS_WHATS_NEW_FIX_COPIED_LINK_QUALITY_TEXT") },
+                                        @{ @"icon": @"subtract", @"text": SPKL(@"SETTINGS_WHATS_NEW_OTHER_BUG_FIXES_UI_IMPROVEMENTS_TEXT") },
                                     ]],
     ];
 }
 
 - (NSString *)finishButtonTitle {
-    return @"Done";
+    return SPKL(@"SETTINGS_WHATS_NEW_DONE_TEXT");
 }
 
 - (BOOL)allowsInteractiveDismiss {

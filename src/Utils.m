@@ -1,3 +1,4 @@
+#import "SPKStrings.h"
 #import "Utils.h"
 #import "App/SPKCore.h"
 #import "App/SPKStabilityGuard.h"
@@ -18,6 +19,7 @@
 #import <objc/runtime.h>
 
 NSString *const kSPKPrefPerAccountSettings = @"general_per_account_settings";
+NSNotificationName const SPKHideExploreGridPreferenceDidChangeNotification = @"SPKHideExploreGridPreferenceDidChangeNotification";
 
 // A full screen modal always slides up from the bottom, which reads as "new
 // sheet" rather than "went deeper". This animates it in from the trailing edge
@@ -548,8 +550,12 @@ static id SPKObjectForSelector(id target, NSString *selectorName) {
     return ((id (*)(id, SEL))objc_msgSend)(target, selector);
 }
 
+// Declared here rather than by importing ActionButtonLookupUtils.h, whose other helpers
+// share names with this file's private statics.
+BOOL SPKKVCKeyIsResolvable(id target, NSString *key);
+
 static id SPKKVCObject(id target, NSString *key) {
-    if (!target || !key.length)
+    if (!SPKKVCKeyIsResolvable(target, key))
         return nil;
 
     @try {
@@ -933,9 +939,9 @@ static NSArray<NSURLQueryItem *> *SPKSanitizedInstagramQueryItems(NSArray<NSURLQ
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         blockedKeys = [NSSet setWithArray:@[
-            @"igsh", @"igshid", @"ig_rid", @"ig_mid",
+            @"igsh", @"igshid", @"igsi", @"ig_rid", @"ig_mid",
             @"utm_source", @"utm_medium", @"utm_campaign", @"utm_term", @"utm_content",
-            @"fbclid"
+            @"fbclid", @"stkn"
         ]];
     });
 
@@ -952,6 +958,13 @@ static NSArray<NSURLQueryItem *> *SPKSanitizedInstagramQueryItems(NSArray<NSURLQ
 @end
 
 @implementation SPKSettingsNavigationController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    // Measure the cache in the background as soon as Settings opens, so the size
+    // is ready by the time the General page's Clear Cache row is on screen.
+    [SPKUtils cachedFormattedCacheSize];
+}
 
 - (void)viewDidDisappear:(BOOL)animated {
     [super viewDidDisappear:animated];
@@ -1030,15 +1043,44 @@ static BOOL SPKPrefIsGlobalKey(NSString *key) {
             @"app_first_run",
             @"app_safe_startup",
             @"app_startup_profiling",
+            // The app font is resolved by the very first view Instagram builds, from
+            // hooks installed in %ctor -- long before any account session exists. A
+            // per-account key would read the global default on every cold launch.
+            @"interface_custom_font",
+            @"interface_language",
+            // Language packs live in one shared directory, so a pack installed or
+            // refreshed under one account is the file every other account reads.
+            // Scoping the settings that govern them per account would let one
+            // account's preference decide what another account sees on disk.
+            @"language_pack_auto_update",
+            @"language_pack_provenance",
+            @"language_pack_last_update_check",
+            @"language_pack_last_update_attempt",
+            @"langpack_catalog_url",
             @"interface_liquid_glass",
             @"interface_liquid_glass_tabbar_mode",
-            @"interface_progressive_blur",
+            @"interface_scroll_edge_style",
+            @"interface_hide_ui_on_capture",
             @"downloads_adv_encoding",
             // Tab/launch layout is configured once at launch and can't re-apply
             // on a live account switch, so it stays global (maintainer's call).
             @"interface_nav_order",
+            @"interface_custom_tab_order",
             @"interface_swipe_tabs",
             @"interface_launch_tab",
+            // The rest of the tab bar configuration goes with the layout for the
+            // same reason, and it has to: the bar is assembled during early
+            // launch, so on the launches where the session has not resolved yet a
+            // per-account key silently reads the global value instead. That made
+            // hidden tabs come and go between launches and account switches.
+            @"interface_hide_feed_tab",
+            @"interface_hide_reels_tab",
+            @"interface_hide_msgs_tab",
+            @"interface_hide_explore_tab",
+            @"interface_hide_profile_tab",
+            @"interface_hide_create_tab",
+            @"interface_hide_tab_bar_in_messages_only",
+            @"interface_saved_tab_carrier",
             // The Settings quick-access long-press is attached to tab-bar buttons
             // as they're built during early launch — before the account session
             // resolves — so a per-account effective key resolves against the
@@ -1062,6 +1104,13 @@ static BOOL SPKPrefIsGlobalKey(NSString *key) {
             @"reels_prevent_doom_scroll",
             @"reels_doom_scroll_limit",
             @"reels_disable_scrolling",
+            // Instagram keeps one sound state for the whole app, and the hooks that
+            // mute it install once per launch, before an account switch can matter.
+            @"reels_disable_auto_unmute",
+            // Saved fake locations are a library of places, not a setting: every
+            // account picks from the same list, while the active place and the on
+            // switch stay per account.
+            @"msgs_fake_location_saved_places",
         ]];
     });
     if ([globalExact containsObject:key])
@@ -1079,9 +1128,6 @@ static BOOL SPKPrefIsGlobalKey(NSString *key) {
         return YES;
 #endif
     if ([key hasPrefix:@"gallery_"])
-        return YES;
-    // interface_hide_*_tab (tab layout) + interface_hide_ui_on_capture.
-    if ([key hasPrefix:@"interface_hide_"])
         return YES;
     return NO;
 }
@@ -1367,11 +1413,73 @@ static id SPKPrefValueWithMasterOverlay(NSString *key) {
     [SPKUtils markCacheClearedNow];
 }
 
-+ (unsigned long long)cleanCacheReturningFreedBytes {
-    unsigned long long bytesBefore = [self cacheSizeBytes];
-    [self cleanCache];
-    unsigned long long bytesAfter = [self cacheSizeBytes];
-    return bytesBefore > bytesAfter ? bytesBefore - bytesAfter : 0;
+// Cache clears and size walks enumerate every file under tmp, Caches and the
+// analytics folder, which takes seconds on a large cache. They all run on this
+// one serial queue so they never touch the main thread and never overlap.
+static dispatch_queue_t SPKCacheWorkQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("com.sparkle.cache-work", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    });
+    return queue;
+}
+
+static const NSTimeInterval kSPKCacheSizeRefreshInterval = 5.0;
+
+// Main-thread state for the last measured cache size.
+static NSString *sSPKCachedCacheSizeText;
+static CFAbsoluteTime sSPKCacheSizeMeasuredAt;
+static BOOL sSPKCacheSizeRefreshing;
+static BOOL sSPKCacheClearing;
+
+static void SPKPublishCacheSize(unsigned long long bytes) {
+    NSString *text = [NSByteCountFormatter stringFromByteCount:(long long)bytes countStyle:NSByteCountFormatterCountStyleFile];
+    BOOL changed = ![text isEqualToString:sSPKCachedCacheSizeText];
+    sSPKCachedCacheSizeText = text;
+    sSPKCacheSizeMeasuredAt = CFAbsoluteTimeGetCurrent();
+    if (changed)
+        [[NSNotificationCenter defaultCenter] postNotificationName:SPKSettingAccessoryTextDidChangeNotification object:nil];
+}
+
++ (void)refreshCacheSize {
+    if (sSPKCacheSizeRefreshing)
+        return;
+    sSPKCacheSizeRefreshing = YES;
+    dispatch_async(SPKCacheWorkQueue(), ^{
+        unsigned long long bytes = [SPKUtils cacheSizeBytes];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            sSPKCacheSizeRefreshing = NO;
+            SPKPublishCacheSize(bytes);
+        });
+    });
+}
+
++ (nullable NSString *)cachedFormattedCacheSize {
+    NSAssert(NSThread.isMainThread, @"cachedFormattedCacheSize is main-thread only");
+    if (!sSPKCacheClearing && (!sSPKCachedCacheSizeText || CFAbsoluteTimeGetCurrent() - sSPKCacheSizeMeasuredAt > kSPKCacheSizeRefreshInterval))
+        [self refreshCacheSize];
+    return sSPKCachedCacheSizeText;
+}
+
++ (BOOL)cleanCacheInBackgroundWithCompletion:(void (^)(unsigned long long freedBytes))completion {
+    NSAssert(NSThread.isMainThread, @"cleanCacheInBackgroundWithCompletion: is main-thread only");
+    if (sSPKCacheClearing)
+        return NO;
+    sSPKCacheClearing = YES;
+    dispatch_async(SPKCacheWorkQueue(), ^{
+        unsigned long long bytesBefore = [SPKUtils cacheSizeBytes];
+        [SPKUtils cleanCache];
+        unsigned long long bytesAfter = [SPKUtils cacheSizeBytes];
+        unsigned long long freedBytes = bytesBefore > bytesAfter ? bytesBefore - bytesAfter : 0;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            sSPKCacheClearing = NO;
+            SPKPublishCacheSize(bytesAfter);
+            if (completion)
+                completion(freedBytes);
+        });
+    });
+    return YES;
 }
 
 + (unsigned long long)cacheSizeBytes {
@@ -1415,30 +1523,55 @@ static id SPKPrefValueWithMasterOverlay(NSString *key) {
     return totalBytes;
 }
 
-+ (NSString *)formattedCacheSize {
-    return [NSByteCountFormatter stringFromByteCount:(long long)[self cacheSizeBytes]
-                                          countStyle:NSByteCountFormatterCountStyleFile];
++ (NSLocale *)spk_activeFormattingLocale {
+    NSString *override = [SPKStrings languageOverride];
+    if (override.length > 0) {
+        return [NSLocale localeWithLocaleIdentifier:[SPKStrings activeLanguage]];
+    }
+
+    NSString *active = [SPKStrings activeLanguage];
+    NSMutableOrderedSet<NSString *> *preferences = [NSMutableOrderedSet orderedSet];
+    [preferences addObjectsFromArray:NSBundle.mainBundle.preferredLocalizations ?: @[]];
+    [preferences addObjectsFromArray:NSLocale.preferredLanguages ?: @[]];
+    for (NSString *identifier in preferences) {
+        NSString *match = [SPKStrings matchAvailable:identifier];
+        if ([match isEqualToString:active]) {
+            return [NSLocale localeWithLocaleIdentifier:identifier];
+        }
+    }
+    return [NSLocale localeWithLocaleIdentifier:active.length > 0 ? active : @"en"];
 }
 
-+ (NSString *)spk_localizedTimeComponent {
-    // `j` resolves to whichever hour cycle the locale/device prefers; if the
-    // resolved template keeps the AM/PM designator ("a") we're on a 12-hour
-    // clock, otherwise the device is set to 24-hour time.
-    NSString *resolved = [NSDateFormatter dateFormatFromTemplate:@"jmm"
-                                                         options:0
-                                                          locale:[NSLocale currentLocale]];
-    BOOL is24Hour = !resolved || [resolved rangeOfString:@"a"].location == NSNotFound;
-    return is24Hour ? @"HH:mm" : @"h:mm a";
++ (nullable NSString *)spk_stringFromDate:(nullable NSDate *)date template:(NSString *)template {
+    if (!date || template.length == 0)
+        return nil;
+    NSLocale *locale = [self spk_activeFormattingLocale];
+    NSDateFormatter *formatter = [NSDateFormatter new];
+    formatter.locale = locale;
+    formatter.dateFormat = [NSDateFormatter dateFormatFromTemplate:template options:0 locale:locale];
+    return [formatter stringFromDate:date];
 }
 
-+ (NSString *)spk_localizedDateComponentIncludingYear:(BOOL)includeYear {
-    NSString *template = includeYear ? @"yMMMd" : @"MMMd";
-    NSString *resolved = [NSDateFormatter dateFormatFromTemplate:template
-                                                         options:0
-                                                          locale:[NSLocale currentLocale]];
-    if (resolved.length)
-        return resolved;
-    return includeYear ? @"MMM d, yyyy" : @"MMM d";  // safe fallback
++ (NSString *)spk_timeSkeleton {
+    NSString *devicePattern = [NSDateFormatter dateFormatFromTemplate:@"jmm"
+                                                              options:0
+                                                               locale:NSLocale.currentLocale];
+    BOOL uses24HourClock = devicePattern.length == 0 || [devicePattern rangeOfString:@"a"].location == NSNotFound;
+    return uses24HourClock ? @"HHmm" : @"hmm";
+}
+
++ (nullable NSString *)spk_formattedTime:(nullable NSDate *)date {
+    return [self spk_stringFromDate:date template:[self spk_timeSkeleton]];
+}
+
++ (nullable NSString *)spk_formattedDate:(nullable NSDate *)date includingYear:(BOOL)includeYear {
+    return [self spk_stringFromDate:date template:(includeYear ? @"yMMMd" : @"MMMd")];
+}
+
++ (nullable NSString *)spk_formattedDateTime:(nullable NSDate *)date includingYear:(BOOL)includeYear {
+    NSString *dateSkeleton = includeYear ? @"yMMMd" : @"MMMd";
+    return [self spk_stringFromDate:date
+                           template:[dateSkeleton stringByAppendingString:[self spk_timeSkeleton]]];
 }
 
 static double SPKTimestampFromValue(id value) {
@@ -1625,17 +1758,7 @@ static NSDate *SPKScanObjectForPostedDate(id target, NSInteger depth) {
 }
 
 + (nullable NSString *)spk_formattedDateHeader:(nullable NSDate *)date {
-    if (!date)
-        return nil;
-    static NSDateFormatter *fmt;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        fmt = [[NSDateFormatter alloc] init];
-    });
-    fmt.dateFormat = [NSString stringWithFormat:@"%@ 'at' %@",
-                      [SPKUtils spk_localizedDateComponentIncludingYear:YES],
-                      [SPKUtils spk_localizedTimeComponent]];
-    return [fmt stringFromDate:date];
+    return [self spk_formattedDateTime:date includingYear:YES];
 }
 
 
@@ -1675,8 +1798,10 @@ static NSDate *SPKScanObjectForPostedDate(id target, NSInteger depth) {
 + (void)evaluateAutomaticCacheClearIfNeeded {
     if (![self shouldAutomaticallyClearCacheNow])
         return;
-    SPKLog(@"General", @"[Sparkle] Automatically clearing cache...");
-    [self cleanCache];
+    dispatch_async(SPKCacheWorkQueue(), ^{
+        SPKLog(@"General", @"[Sparkle] Automatically clearing cache...");
+        [SPKUtils cleanCache];
+    });
 }
 
 // MARK: Display View Controllers
@@ -1856,7 +1981,20 @@ static NSDate *SPKScanObjectForPostedDate(id target, NSInteger depth) {
 + (BOOL)openURL:(NSURL *)url {
     if (!url)
         return NO;
-    [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+    UIApplication *application = [UIApplication sharedApplication];
+    // canOpenURL: answers NO for any scheme the host app has not declared in
+    // LSApplicationQueriesSchemes even when openURL: would still succeed, so it
+    // is only a safe pre-check for web URLs. Custom schemes go straight through
+    // and report their real outcome via the completion handler.
+    NSString *scheme = url.scheme.lowercaseString;
+    BOOL isWebURL = [scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"];
+    if (isWebURL && ![application canOpenURL:url]) {
+        SPKLog(@"General", @"External URL rejected by UIApplication host=%@", url.host ?: @"(none)");
+        return NO;
+    }
+    [application openURL:url options:@{} completionHandler:^(BOOL success) {
+        SPKLog(@"General", @"External URL handoff %@ host=%@", success ? @"accepted" : @"failed", url.host ?: @"(none)");
+    }];
     return YES;
 }
 
@@ -2192,7 +2330,7 @@ static void SPKSetResolvedPKForUsername(NSString *username, NSString *pk) {
     // Nothing changes on screen until this lands, so say that something is
     // happening. Transient, like the 4K candidate fetch: preparatory work before
     // the real flow, cleared on both outcomes.
-    [[SPKNotificationCenter shared] beginTransientProgressWithTitle:@"Opening profile..." onCancel:nil];
+    [[SPKNotificationCenter shared] beginTransientProgressWithTitle:SPKL(@"GENERAL_UTILS_OPENING_PROFILE_TEXT") onCancel:nil];
     [SPKInstagramAPI resolveUserForUsername:clean
                                  completion:^(NSDictionary *userDict, NSError *error) {
                                      NSString *resolvedPK = [userDict[@"pk"] description];
@@ -2578,6 +2716,62 @@ static void SPKSetResolvedPKForUsername(NSString *username, NSString *pk) {
     return [SPKUtils getVideoUrl:video];
 }
 
+// MARK: Scroll Views
++ (void)updateScrollingForFittedContent:(UIScrollView *)scrollView {
+    if (![scrollView isKindOfClass:[UIScrollView class]])
+        return;
+
+    CGFloat viewportHeight = CGRectGetHeight(scrollView.bounds);
+    if (viewportHeight <= 0.0)
+        return;
+
+    UIEdgeInsets insets = scrollView.adjustedContentInset;
+    // A scroll view laid out by its content layout guide reports the old content
+    // size until its own layout pass runs, which can be after the caller's. A
+    // stale zero must not be read as "everything fits".
+    if (scrollView.contentSize.height <= 0.0)
+        return;
+
+    // The insets are part of the scrollable extent: a list that fits the sheet
+    // but not the bar above it still has somewhere to go.
+    CGFloat contentHeight = scrollView.contentSize.height + insets.top + insets.bottom;
+    // A point of slack keeps a content size that lands on the viewport height
+    // by a rounding error from arming the bounce.
+    BOOL overflows = contentHeight > viewportHeight + 1.0;
+
+    if (scrollView.isDragging || scrollView.isDecelerating)
+        return;
+
+    if (!overflows && scrollView.contentOffset.y != -insets.top) {
+        [scrollView setContentOffset:CGPointMake(scrollView.contentOffset.x, -insets.top) animated:NO];
+    }
+
+    // Only the bounce is switched, never `scrollEnabled`. A scroll view whose
+    // content fits and cannot bounce is already immovable, and one that stays
+    // enabled keeps its pan recognizer in the gesture arbitration: a disabled
+    // one hands the first drag to the sheet, which answers by stretching, and
+    // the scroll the drag asked for only lands on the second try.
+    scrollView.bounces = overflows;
+    scrollView.alwaysBounceVertical = overflows;
+}
+
++ (CGFloat)sheetHeightFittingContentOfScrollView:(UIScrollView *)scrollView {
+    if (![scrollView isKindOfClass:[UIScrollView class]])
+        return 0.0;
+
+    CGFloat contentHeight = scrollView.contentSize.height;
+    if (contentHeight <= 0.0)
+        return 0.0;
+
+    // A custom detent resolves to a height *within* the sheet's safe area: the
+    // presentation adds the bottom inset back on its own. The adjusted inset
+    // carries that same bottom inset, so taking it out again leaves the bar
+    // above the content and any inset of the caller's own, and nothing else.
+    UIEdgeInsets insets = scrollView.adjustedContentInset;
+    CGFloat height = contentHeight + insets.top + insets.bottom - scrollView.safeAreaInsets.bottom;
+    return ceil(MAX(height, 0.0));
+}
+
 // MARK: View Controller Helpers
 + (UIViewController *)viewControllerForView:(UIView *)view {
     NSString *viewDelegate = @"viewDelegate";
@@ -2615,16 +2809,16 @@ static void SPKSetResolvedPKForUsername(NSString *username, NSString *pk) {
 };
 + (BOOL)showConfirmation:(void (^)(void))okHandler cancelHandler:(void (^)(void))cancelHandler title:(NSString *)title message:(NSString *)message {
     [SPKIGAlertPresenter presentAlertFromViewController:topMostController()
-                                                  title:title ?: @"Confirm Action"
-                                                message:message ?: @"Are you sure you want to continue?"
+                                                  title:title ?: SPKL(@"GENERAL_UTILS_CONFIRM_ACTION")
+                                                message:message ?: SPKL(@"GENERAL_UTILS_CONTINUE_CONFIRMATION_MESSAGE")
                                                 actions:@[
-                                                    [SPKIGAlertAction actionWithTitle:@"Cancel"
+                                                    [SPKIGAlertAction actionWithTitle:SPKL(@"ALERT_ACTION_CANCEL")
                                                                                 style:SPKIGAlertActionStyleCancel
                                                                               handler:^{
                                                                                   if (cancelHandler)
                                                                                       cancelHandler();
                                                                               }],
-                                                    [SPKIGAlertAction actionWithTitle:@"Confirm"
+                                                    [SPKIGAlertAction actionWithTitle:SPKL(@"ALERT_ACTION_CONFIRM")
                                                                                 style:SPKIGAlertActionStyleDefault
                                                                               handler:^{
                                                                                   if (okHandler)
@@ -2641,13 +2835,13 @@ static void SPKSetResolvedPKForUsername(NSString *username, NSString *pk) {
 }
 + (void)showRestartConfirmation {
     [SPKIGAlertPresenter presentAlertFromViewController:topMostController()
-                                                  title:@"Restart Required"
-                                                message:@"You must restart the app to apply this change"
+                                                  title:SPKL(@"GENERAL_UTILS_RESTART_REQUIRED_TEXT")
+                                                message:SPKL(@"GENERAL_UTILS_MUST_RESTART_APP_APPLY_CHANGE_TEXT")
                                                 actions:@[
-                                                    [SPKIGAlertAction actionWithTitle:@"Later"
+                                                    [SPKIGAlertAction actionWithTitle:SPKL(@"ALERT_ACTION_LATER")
                                                                                 style:SPKIGAlertActionStyleCancel
                                                                               handler:nil],
-                                                    [SPKIGAlertAction actionWithTitle:@"Restart"
+                                                    [SPKIGAlertAction actionWithTitle:SPKL(@"ALERT_ACTION_RESTART")
                                                                                 style:SPKIGAlertActionStyleDefault
                                                                               handler:^{
                                                                                   exit(0);

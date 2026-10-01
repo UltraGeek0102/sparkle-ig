@@ -1,4 +1,5 @@
 #import "SPKSetting.h"
+#include <Foundation/Foundation.h>
 #import "../Utils.h"
 
 @interface SPKSetting ()
@@ -11,6 +12,8 @@
 @end
 
 ///
+
+NSNotificationName const SPKSettingAccessoryTextDidChangeNotification = @"SPKSettingAccessoryTextDidChangeNotification";
 
 @implementation SPKSetting
 
@@ -36,6 +39,18 @@
     setting.title = title;
     setting.subtitle = subtitle;
     setting.icon = icon;
+
+    return setting;
+}
+
++ (instancetype)staticCellWithTitle:(NSString *)title
+                           subtitle:(NSString *)subtitle
+                           imageUrl:(NSString *)imageUrl {
+    SPKSetting *setting = [[self alloc] initWithType:SPKTableCellStatic];
+
+    setting.title = title;
+    setting.subtitle = subtitle;
+    setting.imageUrl = [NSURL URLWithString:imageUrl];
 
     return setting;
 }

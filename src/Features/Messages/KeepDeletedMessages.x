@@ -1,7 +1,9 @@
 #import "../../AssetUtils.h"
+#import "SPKStrings.h"
 #import "../../InstagramHeaders.h"
 #import "../../Shared/Messages/SPKDirectSeenContext.h"
 #import "../../Shared/Messages/SPKDirectUserResolver.h"
+#import "../../Shared/Messages/SPKPresenceTracking.h"
 #import "../../Shared/UI/SPKNotificationCenter.h"
 #import "../../Utils.h"
 #import "DeletedMessagesLog/SPKDeletedMessagesCapture.h"
@@ -427,12 +429,12 @@ static void spkCaptureMessage(id message) {
     spkTrackContentClass(sid, NSStringFromClass([message class]));
 }
 
-static void spkCaptureMessagesFromUpdate(id update, NSString *ownerPk, NSString *threadId, BOOL persistCandidates) {
+static void spkCaptureMessagesFromUpdate(id update, NSString *ownerPk, NSString *threadId, SPKDMCandidateMode candidateMode) {
     NSArray *inserts = spkIvar(update, "_insertMessages");
     if ([inserts isKindOfClass:NSArray.class]) {
         for (id m in inserts) {
             spkCaptureMessage(m);
-            spkDMCaptureNoteInsert(m, ownerPk, threadId, persistCandidates);
+            spkDMCaptureNoteInsert(m, ownerPk, threadId, candidateMode);
         }
     }
 
@@ -440,7 +442,7 @@ static void spkCaptureMessagesFromUpdate(id update, NSString *ownerPk, NSString 
     if ([replaces isKindOfClass:NSArray.class]) {
         for (id m in replaces) {
             spkCaptureMessage(m);
-            spkDMCaptureNoteInsert(m, ownerPk, threadId, persistCandidates);
+            spkDMCaptureNoteInsert(m, ownerPk, threadId, candidateMode);
         }
     }
 }
@@ -629,7 +631,10 @@ static BOOL spkProcessMessageUpdate(id update, NSString *ownerPk, NSString *thre
     if (!update || !ownerPk.length)
         return NO;
 
-    spkCaptureMessagesFromUpdate(update, ownerPk, threadId, loggingAllowed && spkDeletedLogEnabled());
+    SPKDMCandidateMode candidateMode = SPKDMCandidateModeNone;
+    if (loggingAllowed && spkDeletedLogEnabled())
+        candidateMode = spkKeepDeletedEnabled() ? SPKDMCandidateModeExpiringMediaOnly : SPKDMCandidateModeAll;
+    spkCaptureMessagesFromUpdate(update, ownerPk, threadId, candidateMode);
     if (loggingAllowed)
         spkProcessReactionMutations(update, ownerPk, threadId, applicator);
 
@@ -694,9 +699,13 @@ static BOOL spkProcessMessageUpdate(id update, NSString *ownerPk, NSString *thre
         return NO;
 
     if (loggingAllowed && previews) {
-        NSArray *resolvedPreviews = spkDMCapturePreviewMetadataForKeys(unsendKeys, applicator, ownerPk, threadId);
-        if (resolvedPreviews.count)
-            [previews addObjectsFromArray:resolvedPreviews];
+        // The user's own unsends never show a toast, so don't resolve them.
+        NSMutableArray *previewKeys = NSMutableArray.array;
+        for (id key in unsendKeys) {
+            if (!spkSidSentByOwner(spkServerIdFromKey(key), ownerPk))
+                [previewKeys addObject:key];
+        }
+        spkDMCaptureQueuePreviewMetadataForKeys(previewKeys, applicator, ownerPk, threadId, previews);
     }
     if (logOn)
         spkDMCaptureNoteRemoveKeys(unsendKeys, applicator, ownerPk, threadId);
@@ -781,14 +790,14 @@ static NSSet<NSString *> *spkProcessCacheUpdate(id cacheUpdate, NSString *ownerP
 static NSString *spkUnsentText(NSString *sender, NSString *deleter) {
     if (sender.length && deleter.length) {
         return [sender isEqualToString:deleter]
-                   ? [NSString stringWithFormat:@"%@ unsent a message", sender]
-                   : [NSString stringWithFormat:@"%@ unsent a message from %@", deleter, sender];
+                   ? [NSString stringWithFormat:SPKL(@"MESSAGE_UNSENT_SENDER_FORMAT"), sender]
+                   : [NSString stringWithFormat:SPKL(@"MESSAGE_UNSENT_FROM_FORMAT"), deleter, sender];
     }
     if (sender.length)
-        return [NSString stringWithFormat:@"Message from %@ was unsent", sender];
+        return [NSString stringWithFormat:SPKL(@"MESSAGE_UNSENT_PASSIVE_FORMAT"), sender];
     if (deleter.length)
-        return [NSString stringWithFormat:@"%@ unsent a message", deleter];
-    return @"A message was unsent";
+        return [NSString stringWithFormat:SPKL(@"MESSAGE_UNSENT_SENDER_FORMAT"), deleter];
+    return SPKL(@"MESSAGE_UNSENT_ANONYMOUS");
 }
 
 static NSString *spkNotificationKindPhrase(SPKDeletedMessageKind kind) {
@@ -798,7 +807,7 @@ static NSString *spkNotificationKindPhrase(SPKDeletedMessageKind kind) {
     case SPKDeletedMessageKindVideo:
         return @"video";
     case SPKDeletedMessageKindVoice:
-        return @"voice message";
+        return SPKL(@"MESSAGES_KEEP_DELETED_MESSAGES_VOICE_MESSAGE");
     case SPKDeletedMessageKindGif:
         return @"GIF";
     case SPKDeletedMessageKindSticker:
@@ -838,7 +847,7 @@ static NSString *spkDisplayNameForPreview(NSDictionary *preview, NSString *fallb
     NSString *fullName = [preview[@"senderFullName"] isKindOfClass:NSString.class] ? preview[@"senderFullName"] : nil;
     if (fullName.length)
         return fullName;
-    return fallback.length ? fallback : @"Someone";
+    return fallback.length ? fallback : SPKL(@"MESSAGE_SENDER_UNKNOWN");
 }
 
 static NSString *spkUnsentToastDedupeComponent(NSString *value) {
@@ -928,8 +937,8 @@ static NSString *spkSenderSummary(NSArray<NSString *> *senders) {
     if (n == 2)
         return [NSString stringWithFormat:@"%@ & %@", senders[0], senders[1]];
     NSUInteger others = n - 2;
-    return [NSString stringWithFormat:@"%@, %@ & %lu other%@",
-                                      senders[0], senders[1], (unsigned long)others, others == 1 ? @"" : @"s"];
+    return [NSString stringWithFormat:SPKL(@"SENDER_LIST_MANY_FORMAT"),
+                                      senders[0], senders[1], SPKLP(@"COMMON_OTHER_COUNT", (NSInteger)others)];
 }
 
 // A debounce buffer that collapses a burst of unsent/reaction toasts into one
@@ -1034,10 +1043,10 @@ static SPKUnsentToastBatcher *spkUnsentMessageBatcher(void) {
         };
         batcher.summaryBuilder = ^NSDictionary *(NSArray<NSString *> *senders, NSUInteger count) {
             if (senders.count == 1) {
-                return @{@"title" : [NSString stringWithFormat:@"%@ unsent %lu messages", senders[0], (unsigned long)count]};
+                return @{@"title" : [NSString stringWithFormat:SPKL(@"BATCH_UNSENT_MESSAGES_FORMAT"), senders[0], (unsigned long)count]};
             }
             return @{
-                @"title" : [NSString stringWithFormat:@"%lu messages unsent", (unsigned long)count],
+                @"title" : [NSString stringWithFormat:SPKL(@"BATCH_UNSENT_COUNT_FORMAT"), (unsigned long)count],
                 @"subtitle" : [@"from " stringByAppendingString:spkSenderSummary(senders) ?: @""],
             };
         };
@@ -1054,10 +1063,10 @@ static SPKUnsentToastBatcher *spkUnsentReactionBatcher(void) {
         batcher.iconResource = @"reactions";
         batcher.summaryBuilder = ^NSDictionary *(NSArray<NSString *> *senders, NSUInteger count) {
             if (senders.count == 1) {
-                return @{@"title" : [NSString stringWithFormat:@"%@ removed %lu reactions", senders[0], (unsigned long)count]};
+                return @{@"title" : [NSString stringWithFormat:SPKL(@"MESSAGES_KEEP_DELETED_MESSAGES_VALUE_REMOVED_VALUE_REACTIONS_ACTION"), senders[0], (unsigned long)count]};
             }
             return @{
-                @"title" : [NSString stringWithFormat:@"%lu reactions removed", (unsigned long)count],
+                @"title" : [NSString stringWithFormat:SPKL(@"BATCH_REACTIONS_REMOVED_FORMAT"), (unsigned long)count],
                 @"subtitle" : [@"from " stringByAppendingString:spkSenderSummary(senders) ?: @""],
             };
         };
@@ -1066,7 +1075,7 @@ static SPKUnsentToastBatcher *spkUnsentReactionBatcher(void) {
 }
 
 static void spkShowUnsentToast(NSDictionary *preview, NSString *fallbackSender, NSString *fallbackSenderPk, NSString *fallbackThreadId, NSString *ownerAccount, NSString *fallbackSid) {
-    NSString *sender = preview ? spkDisplayNameForPreview(preview, fallbackSender) : (fallbackSender.length ? fallbackSender : @"Someone");
+    NSString *sender = preview ? spkDisplayNameForPreview(preview, fallbackSender) : (fallbackSender.length ? fallbackSender : SPKL(@"MESSAGE_SENDER_UNKNOWN"));
     SPKDeletedMessageKind kind = [preview[@"kind"] isKindOfClass:NSNumber.class] ? (SPKDeletedMessageKind)[preview[@"kind"] integerValue] : SPKDeletedMessageKindUnknown;
     NSString *text = spkTrimmedSingleLinePreview(preview[@"previewText"] ?: preview[@"text"]);
     NSArray<NSString *> *dedupeKeys = spkUnsentToastDedupeKeys(preview, fallbackSid, sender, kind, text);
@@ -1078,7 +1087,7 @@ static void spkShowUnsentToast(NSDictionary *preview, NSString *fallbackSender, 
         NSString *subtype = [preview[@"shareSubtype"] isKindOfClass:NSString.class] ? preview[@"shareSubtype"] : nil;
         kindPhrase = [SPKDeletedMessageShareSubtypeName(subtype) lowercaseString];
     }
-    NSString *title = [NSString stringWithFormat:@"%@ unsent a %@", sender, kindPhrase];
+    NSString *title = [NSString stringWithFormat:SPKL(@"MESSAGE_UNSENT_KIND_FORMAT"), sender, kindPhrase];
     NSString *subtitle = text.length ? [NSString stringWithFormat:@"\"%@\"", text] : nil;
     if (ownerAccount.length) {
         subtitle = subtitle.length ? [NSString stringWithFormat:@"%@ • %@", title, subtitle] : title;
@@ -1099,7 +1108,7 @@ static void spkShowUnsentToast(NSDictionary *preview, NSString *fallbackSender, 
 static void spkShowUnsentReactionToast(NSDictionary *preview, NSString *ownerAccount) {
     if (![preview isKindOfClass:NSDictionary.class])
         return;
-    NSString *sender = spkDisplayNameForPreview(preview, @"Someone");
+    NSString *sender = spkDisplayNameForPreview(preview, SPKL(@"MESSAGE_SENDER_UNKNOWN"));
     NSString *emoji = [preview[@"emoji"] isKindOfClass:NSString.class] ? preview[@"emoji"] : nil;
     NSString *targetPreview = spkTrimmedSingleLinePreview(preview[@"targetPreview"]);
 
@@ -1112,9 +1121,9 @@ static void spkShowUnsentReactionToast(NSDictionary *preview, NSString *ownerAcc
         return;
 
     NSString *title = emoji.length
-                          ? [NSString stringWithFormat:@"%@ removed a %@ reaction", sender, emoji]
-                          : [NSString stringWithFormat:@"%@ removed a reaction", sender];
-    NSString *subtitle = targetPreview.length ? [NSString stringWithFormat:@"On \"%@\"", targetPreview] : nil;
+                          ? [NSString stringWithFormat:SPKL(@"MESSAGES_KEEP_DELETED_MESSAGES_VALUE_REMOVED_VALUE_REACTION_ACTION"), sender, emoji]
+                          : [NSString stringWithFormat:SPKL(@"MESSAGES_KEEP_DELETED_MESSAGES_VALUE_REMOVED_REACTION_ACTION"), sender];
+    NSString *subtitle = targetPreview.length ? [NSString stringWithFormat:SPKL(@"REACTION_CONTEXT_FORMAT"), targetPreview] : nil;
     if (ownerAccount.length) {
         subtitle = subtitle.length ? [NSString stringWithFormat:@"%@ • %@", title, subtitle] : title;
         title = ownerAccount;
@@ -1155,7 +1164,8 @@ static void spkHandleApplyUpdates(id self, id updates, void (^invokeOriginal)(vo
     BOOL toastOn = SPKNotificationIsEnabled(kSPKNotificationUnsentMessage);
     BOOL reactionOn = spkReactionLogEnabled() || SPKNotificationIsEnabled(kSPKNotificationUnsentReaction);
 
-    if (!keepOn && !logOn && !toastOn && !reactionOn) {
+    BOOL activityOn = SPKPresenceNotificationsEnabled();
+    if (!keepOn && !logOn && !toastOn && !reactionOn && !activityOn) {
         invokeOriginal();
         return;
     }
@@ -1165,7 +1175,8 @@ static void spkHandleApplyUpdates(id self, id updates, void (^invokeOriginal)(vo
         spkDMCaptureRetryPendingRemovals(self, ownerPk);
     NSMutableSet *preserved = NSMutableSet.set;
     NSMutableSet *detected = NSMutableSet.set;
-    NSMutableArray<NSDictionary *> *previews = NSMutableArray.array;
+    // Filled on the capture queue; only read it from spkDMCaptureAfterQueuedWork.
+    NSMutableArray<NSDictionary *> *previews = toastOn ? NSMutableArray.array : nil;
 
     // Reaction previews accumulate into a global during processing; reset so we
     // only fire toasts for this pass.
@@ -1173,9 +1184,11 @@ static void spkHandleApplyUpdates(id self, id updates, void (^invokeOriginal)(vo
 
     if (ownerPk.length && [updates isKindOfClass:NSArray.class]) {
         for (id update in (NSArray *)updates) {
-            NSSet *set = spkProcessCacheUpdate(update, ownerPk, self, detected, previews);
-            if (set.count)
-                [preserved unionSet:set];
+            @autoreleasepool {
+                NSSet *set = spkProcessCacheUpdate(update, ownerPk, self, detected, previews);
+                if (set.count)
+                    [preserved unionSet:set];
+            }
         }
     }
 
@@ -1183,6 +1196,8 @@ static void spkHandleApplyUpdates(id self, id updates, void (^invokeOriginal)(vo
         spkSavePreservedIds();
 
     invokeOriginal();
+    if (activityOn && ownerPk.length)
+        SPKPresenceHandleDirectThreadUpdates(self, updates, ownerPk);
     if (logOn && ownerPk.length)
         spkDMCaptureRetryPendingRemovals(self, ownerPk);
 
@@ -1196,17 +1211,6 @@ static void spkHandleApplyUpdates(id self, id updates, void (^invokeOriginal)(vo
     BOOL foreground = currentPk.length && [currentPk isEqualToString:ownerPk];
     NSString *ownerName = foreground ? nil : spkOwnerUsernameFromApplicator(self);
 
-    // Build the toast set, excluding the user's own unsends — a self-unsend has
-    // the owner as its sender and shouldn't notify. Preserve/log above already
-    // ran and are unaffected.
-    NSMutableArray<NSDictionary *> *toastPreviews = NSMutableArray.array;
-    for (NSDictionary *preview in previews) {
-        NSString *psid = [preview[@"messageId"] isKindOfClass:NSString.class] ? preview[@"messageId"] : nil;
-        NSString *psender = [preview[@"senderPk"] isKindOfClass:NSString.class] ? preview[@"senderPk"] : nil;
-        BOOL ownUnsend = (psender.length && ownerPk.length && [psender isEqualToString:ownerPk]) || spkSidSentByOwner(psid, ownerPk);
-        if (!ownUnsend)
-            [toastPreviews addObject:preview];
-    }
     NSString *toastSid = nil;
     for (NSString *d in detected) {
         if (spkSidSentByOwner(d, ownerPk))
@@ -1222,17 +1226,33 @@ static void spkHandleApplyUpdates(id self, id updates, void (^invokeOriginal)(vo
             spkTrackSenderName(toastSid, toastSenderName);
     }
 
+    if (toastOn && detected.count) {
+        spkDMCaptureAfterQueuedWork(^{
+            NSArray<NSDictionary *> *resolvedPreviews = [previews copy];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                // Skip the user's own unsends: a self-unsend has the owner as its
+                // sender and shouldn't notify. Preserve/log are unaffected.
+                NSMutableArray<NSDictionary *> *toastPreviews = NSMutableArray.array;
+                for (NSDictionary *preview in resolvedPreviews) {
+                    NSString *psid = [preview[@"messageId"] isKindOfClass:NSString.class] ? preview[@"messageId"] : nil;
+                    NSString *psender = [preview[@"senderPk"] isKindOfClass:NSString.class] ? preview[@"senderPk"] : nil;
+                    BOOL ownUnsend = (psender.length && ownerPk.length && [psender isEqualToString:ownerPk]) || spkSidSentByOwner(psid, ownerPk);
+                    if (!ownUnsend)
+                        [toastPreviews addObject:preview];
+                }
+                if (toastPreviews.count) {
+                    for (NSDictionary *preview in toastPreviews)
+                        spkShowUnsentToast(preview, toastSenderName, toastSenderPk, nil, ownerName, toastSid);
+                } else if (toastSid.length) {
+                    spkShowUnsentToast(nil, toastSenderName, toastSenderPk, nil, ownerName, toastSid);
+                }
+            });
+        });
+    }
+
     dispatch_async(dispatch_get_main_queue(), ^{
         if (foreground)
             spkRefreshVisibleCellIndicators();
-        if (toastOn) {
-            if (toastPreviews.count) {
-                for (NSDictionary *preview in toastPreviews)
-                    spkShowUnsentToast(preview, toastSenderName, toastSenderPk, nil, ownerName, toastSid);
-            } else if (toastSid.length) {
-                spkShowUnsentToast(nil, toastSenderName, toastSenderPk, nil, ownerName, toastSid);
-            }
-        }
         if (reactionPreviews.count) {
             for (NSDictionary *preview in reactionPreviews)
                 spkShowUnsentReactionToast(preview, ownerName);
@@ -1447,7 +1467,7 @@ static void spkUpdateCellIndicator(id cell) {
     UIView *badge = UIView.new;
     badge.tag = SPK_PRESERVED_TAG;
     badge.backgroundColor = UIColor.clearColor;
-    badge.accessibilityLabel = @"Unsent";
+    badge.accessibilityLabel = SPKL(@"A11Y_BADGE_UNSENT");
     badge.userInteractionEnabled = NO;
     objc_setAssociatedObject(badge, &kSPKPreservedIndicatorOwnMessageKey, @(sentByCurrentUser), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(badge, &kSPKPreservedIndicatorStyleKey, @"undo_filled_secondary_circle_44", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1485,8 +1505,8 @@ static void spkUpdateCellIndicator(id cell) {
 }
 
 static void (*orig_configureCell)(id, SEL, id, id, id);
-static void new_configureCell(id self, SEL _cmd, id vm, id ringSpec, id launcherSet) {
-    orig_configureCell(self, _cmd, vm, ringSpec, launcherSet);
+static void new_configureCell(id self, SEL _cmd, id vm, id ringSpec, id config) {
+    orig_configureCell(self, _cmd, vm, ringSpec, config);
 
     if (!spkIndicatorEnabled())
         return;
@@ -1585,7 +1605,10 @@ static BOOL spkHook(Class cls, SEL sel, IMP imp, IMP *orig) {
     spkHook(removeCls, NSSelectorFromString(@"executeWithResultHandler:accessoryPackage:"), (IMP)new_removeMutationExecute, (IMP *)&orig_removeMutationExecute);
 
     Class cellCls = spkDirectMessageCellClass();
-    spkHook(cellCls, NSSelectorFromString(@"configureWithViewModel:ringViewSpecFactory:launcherSet:"), (IMP)new_configureCell, (IMP *)&orig_configureCell);
+    // IG 448 renamed the trailing launcherSet: argument to mobileConfig: with the same shape.
+    if (!spkHook(cellCls, NSSelectorFromString(@"configureWithViewModel:ringViewSpecFactory:mobileConfig:"), (IMP)new_configureCell, (IMP *)&orig_configureCell)) {
+        spkHook(cellCls, NSSelectorFromString(@"configureWithViewModel:ringViewSpecFactory:launcherSet:"), (IMP)new_configureCell, (IMP *)&orig_configureCell);
+    }
     spkHook(cellCls, @selector(layoutSubviews), (IMP)new_cellLayoutSubviews, (IMP *)&orig_cellLayoutSubviews);
     spkHook(cellCls, NSSelectorFromString(@"_addTappableAccessoryView:"), (IMP)new_addAccessory, (IMP *)&orig_addAccessory);
 

@@ -1,6 +1,8 @@
+#import "SPKStrings.h"
 #import <UIKit/UIKit.h>
 
 #import "../../Utils.h"
+#import "../../Shared/ActionButton/ActionButtonLookupUtils.h"
 
 static NSString *const kSPKInstantsConfirmReactionPref = @"instants_confirm_reaction";
 
@@ -23,7 +25,7 @@ static NSString *SPKInstantsControlText(UIControl *control) {
         return nil;
     id text = nil;
     @try {
-        text = [control valueForKey:@"text"];
+        text = SPKKVCObject(control, @"text");
     } @catch (__unused NSException *exception) {
     }
     if ([text isKindOfClass:NSString.class])
@@ -61,8 +63,8 @@ static BOOL SPKInstantsLooksLikeEmojiText(NSString *text) {
         showConfirmation:^{
             %orig;
         }
-                   title:@"Confirm Instant Reaction"
-                 message:@"Are you sure you want to react to this Instant?"];
+                   title:SPKL(@"INSTANTS_CONFIRMATION_CONFIRM_INSTANT_REACTION_TITLE")
+                 message:SPKL(@"INSTANTS_INSTANTS_REACTION_CONFIRM_REACT_INSTANT_CONFIRMATION_MESSAGE")];
 }
 %end
 

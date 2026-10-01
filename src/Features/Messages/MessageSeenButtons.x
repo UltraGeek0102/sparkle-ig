@@ -1,11 +1,14 @@
 #import <objc/message.h>
+#import "SPKStrings.h"
 #import <objc/runtime.h>
 #import <substrate.h>
 
 #import "../../AssetUtils.h"
 #import "../../InstagramHeaders.h"
 #import "../../Shared/Messages/SPKDirectAutoSave.h"
+#import "../../Shared/Messages/SPKDirectInboxMenu.h"
 #import "../../Shared/Messages/SPKDirectSeenContext.h"
+#import "../../Shared/Messages/SPKPresenceTracking.h"
 #import "../../Shared/Stories/SPKStoryContext.h"
 #import "../../Shared/UI/SPKChrome.h"
 #import "../../Tweak.h"
@@ -391,7 +394,7 @@ static NSArray<UIMenuElement *> *SPKDirectSeenButtonMenuChildren(id source) {
                                                                   context.threadId ?: @"(unknown)",
                                                                   NSStringFromClass([source class]),
                                                                   source);
-                                                           SPKNotify(kSPKNotificationDirectThreadSeenRule, @"Chat not found", nil, @"error_filled", SPKNotificationToneError);
+                                                           SPKNotify(kSPKNotificationDirectThreadSeenRule, SPKL(@"MESSAGES_DIRECT_AUTO_SAVE_CHAT_NOT_FOUND_TEXT"), nil, @"error_filled", SPKNotificationToneError);
                                                            return;
                                                        }
                                                        SPKNotify(kSPKNotificationDirectThreadSeenRule, title, subtitle, @"circle_check_filled", SPKNotificationToneSuccess);
@@ -423,6 +426,20 @@ static NSArray<UIMenuElement *> *SPKDirectSeenButtonMenuChildren(id source) {
         [children addObject:autoSaveAction];
     }
 
+    // Only offered when activity notifications are on and the thread is a 1:1: presence
+    // is reported per user, so a group has nothing to track.
+    NSString *presenceTitle = SPKPresenceNotificationsEnabled() ? SPKPresenceCurrentChatActionTitle(context) : nil;
+    if (presenceTitle.length > 0) {
+        BOOL isTracked = [presenceTitle isEqualToString:@"Stop Tracking Activity"];
+        UIAction *presenceAction = [UIAction actionWithTitle:presenceTitle
+                                                       image:[SPKAssetUtils menuIconNamed:isTracked ? @"activity_filled" : @"activity"]
+                                                  identifier:nil
+                                                     handler:^(__unused UIAction *action) {
+                                                         SPKPresencePresentChatRuleToggle(context);
+                                                     }];
+        [children addObject:presenceAction];
+    }
+
     UIImage *logImage = [SPKAssetUtils menuIconNamed:@"channels"];
     NSString *partnerPK = nil;
     NSString *partnerName = nil;
@@ -430,7 +447,7 @@ static NSArray<UIMenuElement *> *SPKDirectSeenButtonMenuChildren(id source) {
     // Pass threadId for groups too — presentForThreadId: resolves a group entry
     // via groupForThreadId:, so a group thread opens scoped to its own log.
     NSString *threadId = context.threadId;
-    UIAction *logAction = [UIAction actionWithTitle:@"Deleted Messages"
+    UIAction *logAction = [UIAction actionWithTitle:SPKL(@"ALERT_ACTION_DELETED_MESSAGES")
                                               image:logImage
                                          identifier:nil
                                             handler:^(__unused UIAction *action) {
@@ -444,11 +461,11 @@ static NSArray<UIMenuElement *> *SPKDirectSeenButtonMenuChildren(id source) {
     [children addObject:logAction];
 
     UIImage *settingsImage = [SPKAssetUtils menuIconNamed:@"settings"];
-    UIAction *settingsAction = [UIAction actionWithTitle:@"Messages Settings"
+    UIAction *settingsAction = [UIAction actionWithTitle:SPKL(@"ALERT_ACTION_MESSAGES_SETTINGS")
                                                    image:settingsImage
                                               identifier:nil
                                                  handler:^(__unused UIAction *action) {
-                                                     SPKNotify(kSPKNotificationOpenTopicSettings, @"Opened settings", nil, @"settings", SPKNotificationToneForIconResource(@"settings"));
+                                                     SPKNotify(kSPKNotificationOpenTopicSettings, SPKL(@"COMMON_OPENED_SETTINGS_TOAST"), nil, @"settings", SPKNotificationToneForIconResource(@"settings"));
                                                      [SPKUtils showSettingsForTopicTitle:@"Messages"];
                                                  }];
     [children addObject:settingsAction];
@@ -526,119 +543,41 @@ static void SPKDirectClearActiveThreadContextForController(id controller, NSStri
     objc_setAssociatedObject(controller, kSPKDirectThreadIdAssocKey, nil, OBJC_ASSOCIATION_ASSIGN);
 }
 
-static id (*SPKDirectOrigInboxContextMenuConfiguration)(id, SEL, id);
-
-static id SPKDirectInboxContextMenuConfiguration(id self, SEL _cmd, id indexPath) {
-    id configuration = SPKDirectOrigInboxContextMenuConfiguration(self, _cmd, indexPath);
-    if (![configuration isKindOfClass:[UIContextMenuConfiguration class]])
-        return configuration;
-
-    id adapter = SPKKVCObject(self, @"listAdapter");
-    if (!adapter)
-        adapter = [SPKUtils getIvarForObj:self name:"_listAdapter"];
-    if (!adapter || ![indexPath respondsToSelector:@selector(section)]) {
-        SPKLog(@"Messages", @"[Sparkle MessagesSeen] Inbox menu context skipped: missing adapter/indexPath controller=%@<%p>",
-               NSStringFromClass([self class]),
-               self);
-        return configuration;
-    }
-
-    SEL sectionControllerSelector = NSSelectorFromString(@"sectionControllerForSection:");
-    if (![adapter respondsToSelector:sectionControllerSelector]) {
-        SPKLog(@"Messages", @"[Sparkle MessagesSeen] Inbox menu context skipped: adapter lacks sectionControllerForSection adapter=%@<%p>",
-               NSStringFromClass([adapter class]),
-               adapter);
-        return configuration;
-    }
-
-    NSInteger section = [(NSIndexPath *)indexPath section];
-    id sectionController = ((id (*)(id, SEL, NSInteger))objc_msgSend)(adapter, sectionControllerSelector, section);
-    id viewModel = SPKKVCObject(sectionController, @"viewModel");
-    if (!viewModel)
-        viewModel = [SPKUtils getIvarForObj:sectionController name:"_viewModel"];
-    if (!viewModel)
-        viewModel = SPKKVCObject(sectionController, @"item");
-    if (!viewModel)
-        viewModel = [SPKUtils getIvarForObj:sectionController name:"_item"];
-
-    if (!viewModel) {
-        SPKLog(@"Messages", @"[Sparkle MessagesSeen] Inbox menu context skipped: missing viewModel section=%ld sectionController=%@<%p>",
-               (long)section,
-               NSStringFromClass([sectionController class]),
-               sectionController);
-        return configuration;
-    }
-
-    SPKDirectThreadContext *context = SPKDirectThreadContextFromInboxViewModel(viewModel);
-    NSString *toggleTitle = SPKDirectCurrentThreadRuleActionTitle(context);
-    if (toggleTitle.length == 0) {
-        SPKLog(@"Messages", @"[Sparkle MessagesSeen] Inbox menu context skipped: missing thread context viewModel=%@<%p>",
-               NSStringFromClass([viewModel class]),
-               viewModel);
-        return configuration;
-    }
-    UIContextMenuConfiguration *originalConfiguration = (UIContextMenuConfiguration *)configuration;
-    UIContextMenuActionProvider originalProvider = SPKKVCObject(originalConfiguration, @"actionProvider");
-    UIContextMenuContentPreviewProvider originalPreview = SPKKVCObject(originalConfiguration, @"previewProvider");
-    id<NSCopying> originalIdentifier = SPKKVCObject(originalConfiguration, @"identifier");
-
-    UIContextMenuActionProvider wrappedProvider = ^UIMenu *(NSArray<UIMenuElement *> *suggestedActions) {
-        UIMenu *baseMenu = nil;
-        @try {
-            baseMenu = originalProvider ? originalProvider(suggestedActions) : [UIMenu menuWithChildren:suggestedActions];
-        } @catch (NSException *exception) {
-            SPKLog(@"Messages", @"[Sparkle MessagesSeen] Inbox menu original provider failed threadId=%@ exception=%@ reason=%@",
-                   context.threadId ?: @"(unknown)",
-                   exception.name,
-                   exception.reason);
-            return [UIMenu menuWithChildren:suggestedActions ?: @[]];
+// The "start/stop marking seen" row is contributed to the shared inbox long-press
+// menu rather than hooked here: several Sparkle features want rows on that same
+// menu, and a per-feature hook would leave them wrapping each other in install
+// order. See SPKDirectInboxMenu.
+static void SPKInstallDirectInboxSeenContextMenuHook(void) {
+    SPKDirectInboxMenuRegisterProvider(@"seen", 10, ^NSArray<UIMenuElement *> *(SPKDirectThreadContext *context, id viewModel) {
+        NSString *title = SPKDirectCurrentThreadRuleActionTitle(context);
+        if (title.length == 0) {
+            SPKLog(@"Messages", @"[Sparkle MessagesSeen] Inbox menu row skipped: no rule title viewModel=%@<%p>",
+                   NSStringFromClass([viewModel class]),
+                   viewModel);
+            return nil;
         }
-        if (![baseMenu isKindOfClass:[UIMenu class]]) {
-            SPKLog(@"Messages", @"[Sparkle MessagesSeen] Inbox menu original provider returned invalid menu threadId=%@ menu=%@",
-                   context.threadId ?: @"(unknown)",
-                   baseMenu);
-            return [UIMenu menuWithChildren:suggestedActions ?: @[]];
-        }
-        NSString *currentTitle = SPKDirectCurrentThreadRuleActionTitle(context) ?: toggleTitle;
+
         BOOL applies = SPKDirectManualSeenAppliesToSource(context);
-        UIImage *image = [SPKAssetUtils instagramIconNamed:applies ? @"eye_off" : @"eye"];
-        UIAction *toggleAction = [UIAction actionWithTitle:currentTitle
+        // Instagram's own rows in this menu carry 24pt glyphs, so ours matches them
+        // rather than the 22pt Sparkle uses in menus it owns outright.
+        UIImage *image = [SPKAssetUtils menuIconNamed:applies ? @"eye_off" : @"eye"
+                                            pointSize:kSPKInstagramMenuIconPointSize];
+        UIAction *toggleAction = [UIAction actionWithTitle:title
                                                      image:image
                                                 identifier:nil
                                                    handler:^(__unused UIAction *action) {
                                                        NSString *notificationTitle = nil;
                                                        NSString *notificationSubtitle = nil;
                                                        if (!SPKDirectToggleCurrentThreadRule(context, &notificationTitle, &notificationSubtitle)) {
-                                                           SPKLog(@"Messages", @"[Sparkle MessagesSeen] Inbox menu toggle failed threadId=%@ viewModel=%@<%p>",
-                                                                  context.threadId ?: @"(unknown)",
-                                                                  NSStringFromClass([viewModel class]),
-                                                                  viewModel);
-                                                           SPKNotify(kSPKNotificationDirectThreadSeenRule, @"Chat not found", nil, @"error_filled", SPKNotificationToneError);
+                                                           SPKLog(@"Messages", @"[Sparkle MessagesSeen] Inbox menu toggle failed threadId=%@", context.threadId ?: @"(unknown)");
+                                                           SPKNotify(kSPKNotificationDirectThreadSeenRule, SPKL(@"MESSAGES_DIRECT_AUTO_SAVE_CHAT_NOT_FOUND_TEXT"), nil, @"error_filled", SPKNotificationToneError);
                                                            return;
                                                        }
                                                        SPKNotify(kSPKNotificationDirectThreadSeenRule, notificationTitle, notificationSubtitle, @"circle_check_filled", SPKNotificationToneSuccess);
                                                    }];
-        NSMutableArray *children = [baseMenu.children mutableCopy] ?: [NSMutableArray array];
-        [children addObject:toggleAction];
-        return [baseMenu menuByReplacingChildren:children];
-    };
-
-    return [UIContextMenuConfiguration configurationWithIdentifier:originalIdentifier
-                                                   previewProvider:originalPreview
-                                                    actionProvider:wrappedProvider];
-}
-
-static void SPKInstallDirectInboxSeenContextMenuHook(void) {
-    SEL selector = NSSelectorFromString(@"networkingCoordinator_contextMenuConfigurationForThreadCellAtIndexPath:");
-    for (NSString *className in @[ @"IGDirectInboxViewController", @"IGDirectInboxViewControllerImpl" ]) {
-        Class inboxClass = NSClassFromString(className);
-        if (!inboxClass || !class_getInstanceMethod(inboxClass, selector))
-            continue;
-        MSHookMessageEx(inboxClass, selector, (IMP)SPKDirectInboxContextMenuConfiguration, (IMP *)&SPKDirectOrigInboxContextMenuConfiguration);
-        SPKLog(@"Messages", @"[Sparkle MessagesSeen] Installed inbox seen list context menu hook class=%@", className);
-        return;
-    }
-    SPKLog(@"Messages", @"[Sparkle MessagesSeen] Inbox seen list context menu hook not installed: selector not found");
+        return @[ toggleAction ];
+    });
+    SPKDirectInboxMenuInstallHooksIfNeeded();
 }
 
 static id SPKKVCObject(id target, NSString *key) {
@@ -803,13 +742,42 @@ static UIView *SPKThreadSeenBubbleContainer(UIViewController *controller) {
     return container;
 }
 
+// In-thread half sheets (the GIF/sticker picker, the media gallery, ...) are
+// not modal presentations: IGDirectThreadViewHalfSheetPresenter hosts them in
+// a full-screen passthrough view added straight onto the thread's root view,
+// above the bubble's slot. While that host is up, the sheet can sit at any
+// detent or be dragged to full screen with the keyboard down, so hide for the
+// host's whole lifetime rather than chasing the sheet's height. Its arrival
+// and removal re-lay out the root view, which re-runs this check.
+static Class SPKThreadHalfSheetHostClass(void) {
+    static Class cls;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cls = NSClassFromString(@"_TtC36IGDirectThreadViewHalfSheetPresenter42IGDirectThreadViewHalfSheetPassthroughView")
+                  ?: NSClassFromString(@"IGDirectThreadViewHalfSheetPresenter.IGDirectThreadViewHalfSheetPassthroughView");
+    });
+    return cls;
+}
+
+static BOOL SPKThreadSeenBubbleCoveredBySheet(UIViewController *controller) {
+    Class hostClass = SPKThreadHalfSheetHostClass();
+    if (!hostClass)
+        return NO;
+    for (UIView *view in controller.view.subviews) {
+        if ([view isKindOfClass:hostClass] && !view.hidden && view.alpha > 0.01)
+            return YES;
+    }
+    return NO;
+}
+
 static void SPKUpdateThreadSeenBubbleVisibility(UIViewController *controller, BOOL animated) {
     UIView *container = SPKThreadSeenBubbleContainer(controller);
     if (!container)
         return;
 
-    // Always available while in the thread; only hides while you're typing.
-    BOOL visible = SPKThreadComposerTextLength(controller) == 0;
+    // Always available while in the thread; only hides while you're typing or
+    // while an in-thread half sheet (GIF/sticker picker) is up.
+    BOOL visible = SPKThreadComposerTextLength(controller) == 0 && !SPKThreadSeenBubbleCoveredBySheet(controller);
 
     CGFloat target = visible ? 1.0 : 0.0;
     container.userInteractionEnabled = visible;
@@ -998,6 +966,7 @@ static void SPKEnsureThreadSeenKeyboardObserver(UIViewController *controller) {
                                              SPKLayoutThreadSeenBubble(settled);
                                          }
                                          completion:nil];
+                        SPKUpdateThreadSeenBubbleVisibility(settled, YES);
                     };
 
                     if (duration > 0.0) {
@@ -1012,6 +981,9 @@ static void SPKEnsureThreadSeenKeyboardObserver(UIViewController *controller) {
                         SPKLayoutThreadSeenBubble(strong);
                         settle(YES);
                     }
+                    // Fade out up front when the keyboard came for the GIF/sticker
+                    // sheet's search field, instead of sliding across the sheet.
+                    SPKUpdateThreadSeenBubbleVisibility(strong, YES);
                 }];
     objc_setAssociatedObject(controller, kSPKThreadSeenKeyboardObserverKey, token, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
@@ -1216,9 +1188,9 @@ SPKPlayButtonTappedHaptic();
 UIViewController *nearestVC = [SPKUtils nearestViewControllerForView:self];
 if ([nearestVC isKindOfClass:%c(IGDirectThreadViewController)]) {
     if (SPKMarkDirectThreadMessagesAsSeen(nearestVC)) {
-        SPKNotify(kSPKNotificationThreadMessagesMarkSeen, @"Marked messages as seen", nil, @"circle_check_filled", SPKNotificationToneSuccess);
+        SPKNotify(kSPKNotificationThreadMessagesMarkSeen, SPKL(@"MESSAGES_SEEN_MARKED_MESSAGES_TOAST"), nil, @"circle_check_filled", SPKNotificationToneSuccess);
     } else {
-        SPKNotify(kSPKNotificationThreadMessagesMarkSeen, @"Unable to mark messages as seen", nil, @"error_filled", SPKNotificationToneError);
+        SPKNotify(kSPKNotificationThreadMessagesMarkSeen, SPKL(@"MESSAGES_SEEN_MARK_MESSAGES_FAILED_TOAST"), nil, @"error_filled", SPKNotificationToneError);
     }
 }
 }
@@ -1258,8 +1230,12 @@ if ([nearestVC isKindOfClass:%c(IGDirectThreadViewController)]) {
     SPK_PERF_SCOPE(@"MessageSeenButtons.viewDidLayoutSubviews");
     // Cheap reposition only — the bubble is installed in viewDidAppear. Avoids
     // rebuilding thread context on every layout pass.
-    if (SPKThreadSeenBubbleEnabled())
+    if (SPKThreadSeenBubbleEnabled()) {
         SPKLayoutThreadSeenBubble(self);
+        // Half sheets open and close without any keyboard event; their host
+        // view coming and going re-lays out the root, so re-check here.
+        SPKUpdateThreadSeenBubbleVisibility(self, YES);
+    }
 }
 
 // Composer text listener callback — hide the bubble the moment you start typing,
@@ -1279,9 +1255,9 @@ if ([nearestVC isKindOfClass:%c(IGDirectThreadViewController)]) {
 (void)sender;
 SPKPlayButtonTappedHaptic();
 if (SPKMarkDirectThreadMessagesAsSeen(self)) {
-    SPKNotify(kSPKNotificationThreadMessagesMarkSeen, @"Marked messages as seen", nil, @"circle_check_filled", SPKNotificationToneSuccess);
+    SPKNotify(kSPKNotificationThreadMessagesMarkSeen, SPKL(@"MESSAGES_SEEN_MARKED_MESSAGES_TOAST"), nil, @"circle_check_filled", SPKNotificationToneSuccess);
 } else {
-    SPKNotify(kSPKNotificationThreadMessagesMarkSeen, @"Unable to mark messages as seen", nil, @"error_filled", SPKNotificationToneError);
+    SPKNotify(kSPKNotificationThreadMessagesMarkSeen, SPKL(@"MESSAGES_SEEN_MARK_MESSAGES_FAILED_TOAST"), nil, @"error_filled", SPKNotificationToneError);
 }
 // The bubble stays put after marking — no seen-state-driven hide/reappear.
 }
